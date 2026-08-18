@@ -33,10 +33,12 @@ class GaussianOccHead(BaseModule):
         self.num_classes = num_classes
         self.classes = list(range(num_classes))
 
-        sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/model/head/gaussian_occ_head/ops/localagg')
+        sys.path.append(
+            "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/model/head/gaussian_occ_head/ops/localagg"
+        )
         from local_aggregate import LocalAggregator
         self.aggregator = LocalAggregator(**cuda_kwargs)
-        
+
         if with_empty:
             self.empty_scalar = nn.Parameter(torch.ones(1, dtype=torch.float))
             # self.empty_scalar = nn.Parameter(torch.tensor([10], dtype=torch.float))
@@ -53,14 +55,14 @@ class GaussianOccHead(BaseModule):
         self.semantic_start = 10 + int(include_opa)
         self.semantic_dim = self.num_classes if not with_empty else self.num_classes - 1
         self.semantics_activation = semantics_activation
-    
+
     def anchor2gaussian(self, anchor, metas):
-        
+
         # vox_near = metas[0]['vox_origin']
         # scene_size = metas[0]['scene_size']
         # vox_far = vox_near + scene_size
         # nyu_pc_range = torch.cat([vox_near, vox_far], dim=0).to(anchor.device)
-        
+
         # myfix
         cam_vox_range = metas[0]['cam_vox_range'].to(anchor.device)
         xyz = cartesian(anchor, cam_vox_range)
@@ -73,7 +75,7 @@ class GaussianOccHead(BaseModule):
         opas = safe_sigmoid(anchor[..., 10: (10 + int(self.include_opa))])
         shs = torch.zeros(*anchor.shape[:-1], 0, device=anchor.device, dtype=anchor.dtype)
         semantics = anchor[..., self.semantic_start: (self.semantic_start + self.semantic_dim)]
-        
+
         if self.semantics_activation == 'softmax':
             semantics = semantics.softmax(dim=-1)
         elif self.semantics_activation == 'softplus':
@@ -81,7 +83,7 @@ class GaussianOccHead(BaseModule):
         # import pdb; pdb.set_trace()
         # softrelu
         # semantics = F.softplus(semantics)
-        
+
         gaussian = GaussianPrediction(
             means=xyz,
             scales=gs_scales,
@@ -91,7 +93,7 @@ class GaussianOccHead(BaseModule):
             semantics=semantics
         )
         return gaussian
-    
+
     def prepare_gaussian_args(self, gaussians, metas):
         means = gaussians.means # b, g, 3
         # myfix
@@ -111,7 +113,7 @@ class GaussianOccHead(BaseModule):
         rotations = gaussians.rotations # b, g, 4
         opacities = gaussians.semantics # b, g, c
         origi_opa = gaussians.opacities # b, g, 1
-        
+
         if origi_opa.numel() == 0:
             origi_opa = torch.ones_like(opacities[..., :1], requires_grad=False)
         if self.with_emtpy:
@@ -121,10 +123,10 @@ class GaussianOccHead(BaseModule):
             vox_center = vox_origin + scene_size / 2
             self.empty_mean = vox_center[None, None, :]
             # self.register_buffer('empty_mean', torch.tensor(empty_args['mean'])[None, None, :])
-            
+
             # opacities = torch.cat([torch.zeros_like(opacities[..., :1]), opacities], dim=-1) # FIXME
             opacities = torch.cat([opacities, torch.zeros_like(opacities[..., :1])], dim=-1) # FIXME
-            
+
             means = torch.cat([means, self.empty_mean], dim=1)
             scales = torch.cat([scales, self.empty_scale], dim=1)
             rotations = torch.cat([rotations, self.empty_rot], dim=1)
@@ -145,7 +147,7 @@ class GaussianOccHead(BaseModule):
 
         M = torch.matmul(S, R)
         Cov = torch.matmul(M.transpose(-1, -2), M)
-        
+
         # myfix
         c2w_rot = metas[0]['cam2world'][:3, :3]
         c2w_rot_T = metas[0]['cam2world'][:3, :3].T
@@ -153,22 +155,22 @@ class GaussianOccHead(BaseModule):
         c2w_rot_T = c2w_rot_T.unsqueeze(0).unsqueeze(0).repeat(bs, g, 1, 1).to(torch.float32)
         Cov = torch.matmul(c2w_rot, torch.matmul(Cov, c2w_rot_T))
         # endfix
-        
+
         CovInv = Cov.float().cpu().inverse().cuda() # b, g, 3, 3
         return means, origi_opa, opacities, scales, CovInv
-    
+
     def prepare_gt_xyz(self, metas, tensor):
         # gt_xyz = []
         # for meta in metas:
         #     gt_xyz.append(meta['occ_xyz'])
         # gt_xyz = torch.from_numpy(np.array(gt_xyz)).to(tensor.device, tensor.dtype)
-        
+
         gt_xyz = metas[0]['occ_xyz'].unsqueeze(0)
         # import pdb; pdb.set_trace()
         return gt_xyz
 
     def forward(self, bev_feat, points, label, output_dict, metas, test_mode=False):
-        # means3D: 
+        # means3D:
         # gt_xyz: b, x, y, z, 3
         # gt_label: b, x, y, z
 
@@ -184,11 +186,11 @@ class GaussianOccHead(BaseModule):
         means, origi_opa, opacities, scales, CovInv = self.prepare_gaussian_args(gaussians, metas)
         sampled_xyz = gt_xyz.flatten(1, 3).float()
         origi_opa = origi_opa.flatten(1, 2)
-        
+
         semantics = []
         nyu_pc_min = metas[0]['vox_origin']
         nyu_pc_max = nyu_pc_min + metas[0]['scene_size']
-        
+
         epsilon = 1e-3
         mask = (means[..., 0] > (nyu_pc_min[0]+epsilon)) & (means[..., 0] < (nyu_pc_max[0]-epsilon)) & (means[..., 1] > (nyu_pc_min[1]+epsilon)) & (means[..., 1] < (nyu_pc_max[1]-epsilon)) & (means[..., 2] > (nyu_pc_min[2]+epsilon)) & (means[..., 2] < (nyu_pc_max[2]-epsilon))
         means = means[mask].unsqueeze(0)
@@ -196,9 +198,9 @@ class GaussianOccHead(BaseModule):
         opacities = opacities[mask].unsqueeze(0)
         scales = scales[mask].unsqueeze(0)
         CovInv = CovInv[mask].unsqueeze(0)
-        
+
         origin_use = metas[0]['vox_origin'].to(torch.float32).to(means.device)
-        
+
         for i in range(len(sampled_xyz)):
             semantic = self.aggregator(
                 sampled_xyz[i:(i+1)], 
@@ -210,10 +212,10 @@ class GaussianOccHead(BaseModule):
                 metas,
                 origin_use) # n, c
             semantics.append(semantic)
-        
+
         semantics = torch.stack(semantics, dim=0).transpose(1, 2) # [1, 13, 129600]
         spatial_shape = label.shape[2:] # [60, 60, 36]
-        
+
         result_dict = {
             'ce_input': semantics.unflatten(-1, spatial_shape), # [1, 13, 60, 60, 36]
             'ce_label': label.squeeze(0),                       # [1, 60, 60, 36]
@@ -222,9 +224,8 @@ class GaussianOccHead(BaseModule):
         }
         # import pdb; pdb.set_trace()
         output_dict.update(result_dict)
-        
+
         output_dict.update({
                 'gaussians': gaussians
             })
         return output_dict
-

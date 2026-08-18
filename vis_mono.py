@@ -36,7 +36,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
+sys.path.append("/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc")
 sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
 from train_utils import compute_CP_mega_matrix, downsample_label
 
@@ -329,9 +329,6 @@ def main(args):
                 draw(to_vis, voxel_size=0.08, intrinsic=cam_k, cam_pose=cam_pose, d=0.5,
                            save_path=save_path)
 
-    
-
-        
 
 if __name__ == '__main__':
     # Training settings

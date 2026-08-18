@@ -20,8 +20,10 @@ import open3d as o3d
 import warnings
 warnings.filterwarnings("ignore")
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
+# sys.path.append("/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc")
+# sys.path.append("/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/Depth-Anything-V2/metric_depth")
 from PIL import Image
 
 def pass_print(*args, **kwargs):
@@ -47,18 +49,37 @@ def main(args):
     eval_freq = cfg.eval_freq
     print_freq = cfg.print_freq
 
-    # init DDP
-    distributed = True
-    world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
-    rank = int(os.environ["RANK"])  # node id
-    gpu = int(os.environ['LOCAL_RANK']) 
-    dist.init_process_group(
-        backend="nccl", init_method=f"env://", 
-        world_size=world_size, rank=rank
-    )
+    # # init DDP
+    # distributed = True
+    # world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
+    # rank = int(os.environ["RANK"])  # node id
+    # gpu = int(os.environ['LOCAL_RANK']) 
+    # dist.init_process_group(
+    #     backend="nccl", init_method=f"env://", 
+    #     world_size=world_size, rank=rank
+    # )
+    # # dist.barrier()
+    # torch.cuda.set_device(gpu)
 
-    # dist.barrier()
-    torch.cuda.set_device(gpu)
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if distributed:
+        # init DDP
+        # distributed = True
+        world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
+        rank = int(os.environ["RANK"])  # node id
+
+        num_gpus = torch.cuda.device_count()
+        torch.cuda.set_device(rank % num_gpus)
+        dist.init_process_group(
+            backend="nccl",
+            # init_method=f"env://",
+            world_size=world_size,
+        )
+        rank, world_size = get_dist_info()
+    else:
+        rank = 0
+        world_size = 1
+        # torch.cuda.set_device(0)
 
     if not is_main_process():
         import builtins
@@ -79,7 +100,7 @@ def main(args):
     from model import build_model
     my_model = build_model(cfg.model)
     
-    if cfg.flag_depthanything_as_gt:
+    if cfg.flag_depthanything_as_gt: # True
         my_model.depthanything.requires_grad_(False)
     
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
@@ -185,10 +206,12 @@ def main(args):
                 if isinstance(data[i], torch.Tensor):
                     data[i] = data[i].cuda()
             (imgs, metas, label) = data
+            
             for k, v in metas[0].items():
                 if not (k in metas_tensor_keys_inv):
                     metas[0][k] = torch.tensor(v).cuda()
             metas[0]['img_depthbranch'] = metas[0]['img_depthbranch'].cuda()
+            
             # forward + backward + optimize
             data_time_e = time.time()
             
@@ -301,7 +324,7 @@ def main(args):
             logger.info(f'Current val iou of sem_cls is {info_sem_cls}')
             logger.info(f'Current val iou of sem is {info_sem}')
             logger.info(f'Current val iou of geo is {info_geo}')
-        
+
 
 if __name__ == '__main__':
     # Training settings
@@ -312,4 +335,3 @@ if __name__ == '__main__':
 
     args, _ = parser.parse_known_args()
     main(args)
-    

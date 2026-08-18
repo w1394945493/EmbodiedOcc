@@ -5,12 +5,12 @@ from mmengine.model import BaseModule
 from mmengine.registry import MODELS
 from mmseg.registry import MODELS as MODELS_SEG
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/EfficientNet-PyTorch')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/EfficientNet-PyTorch')
 from efficientnet_pytorch import EfficientNet
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/model/depthbranch')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/model/depthbranch')
 from depth_anything_v2.dpt import DepthAnythingV2
 from depthnet import DepthNet
 from unet2d import DecoderBN
@@ -49,7 +49,9 @@ class GaussianSegmentor(BaseModule):
                     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
                 }
                 self.depthanything = DepthAnythingV2(**{**model_configs['vitb'], 'max_depth':20})
-                checkpoint = torch.load('/data1/code/wyq/gaussianindoor/EmbodiedOcc/checkpoints/finetune_scannet_depthanythingv2.pth', map_location='cpu')['model']
+                # checkpoint = torch.load('/data1/code/wyq/gaussianindoor/EmbodiedOcc/checkpoints/finetune_scannet_depthanythingv2.pth', map_location='cpu')['model']
+                checkpoint = torch.load('/c20250502/wangyushen/Weights/gpocc/finetune_scannet_depthanythingv2.pth', map_location='cpu')['model']
+
                 new_state_dict = {}
                 for k, v in checkpoint.items():
                     if k.startswith('module.'):
@@ -58,7 +60,7 @@ class GaussianSegmentor(BaseModule):
                         new_key = k
                     new_state_dict[new_key] = v
                 self.depthanything.load_state_dict(new_state_dict)
-            
+
             basemodel_name = "tf_efficientnet_b7_ns"
             num_features = 2560
             print("Loading base model ()...".format(basemodel_name), end="")
@@ -67,15 +69,15 @@ class GaussianSegmentor(BaseModule):
             # )
             basemodel = torch.hub.load(
                 "rwightman/gen-efficientnet-pytorch", basemodel_name, pretrained=True
-            )
+            )   # efficient net
             print("Done.")
             # Remove last layer
             print("Removing last two layers (global_pool & classifier).")
             basemodel.global_pool = nn.Identity()
             basemodel.classifier = nn.Identity()
-            
+
             self.backbone = basemodel
-            
+
             self.neck = DecoderBN(
                 out_feature=96,
                 use_decoder=True,
@@ -94,9 +96,9 @@ class GaussianSegmentor(BaseModule):
             print("Removing last two layers (global_pool & classifier).")
             basemodel.global_pool = nn.Identity()
             basemodel.classifier = nn.Identity()
-            
+
             self.backbone = basemodel
-            
+
             self.neck = DecoderBN(
                 out_feature=96,
                 use_decoder=True,
@@ -116,11 +118,11 @@ class GaussianSegmentor(BaseModule):
         # Downloading: "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b7-dcc49843.pth" to /home/wyq/.cache/torch/hub/checkpoints/efficientnet-b7-dcc49843.pth
         B, N, C, H, W = imgs.size()
         imgs = imgs.reshape(B * N, C, H, W) # 1, 3, 480, 640
-        
+
         feature_x = [imgs]
         feature_idx = 0
         this_x = feature_x[-1]
-        for k, v in self.backbone._modules.items():
+        for k, v in self.backbone._modules.items(): # backbone: GenEfficientNet
             if k == "blocks":
                 for ki, vi in v._modules.items():
                     this_x = vi(this_x)
@@ -132,43 +134,43 @@ class GaussianSegmentor(BaseModule):
                 feature_idx += 1
                 if feature_idx in [4, 5, 6, 8, 11]:
                     feature_x.append(this_x)
-            
-        img_feats_backbone = feature_x
-        
+
+        img_feats_backbone = feature_x  # 6:(1 3 480 640) (1 32 240 320) (1 48 120 160) (1 80 60 80) (1 224 30 40) (1 2560 15 20)
+
         # list of [2560, 15, 20]
         img_feats_out = self.neck(img_feats_backbone) # dict
-        
-        img_feats_reshaped = []
+
+        img_feats_reshaped = [] 
         for img_feat in img_feats_out.values():
             BN, C, H, W = img_feat.size()
             if W != 640:
-                img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
-                
-        return img_feats_reshaped, img_feats_out['1_1'] # list of [1, 1, 96, 28, 36], [1, 1, 96, 14, 18], [1, 1, 96, 7, 9]
-    
+                img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))   # 4:(1 1 96 240 320) (1 1 96 120 160) (1 1 96 60 80) (1 1 96 30 40)
+
+        return img_feats_reshaped, img_feats_out['1_1'] # 4:(1 1 96 240 320) (1 1 96 120 160) (1 1 96 60 80) (1 1 96 30 40); (1 96 480 640)
+
     def obtain_bev(self, imgs, metas):
         B, F, N, C, H, W = imgs.shape
         imgs = imgs.reshape(B*F, N, C, H, W)
-        
+        # 使用efficient net提取图像特征
         mlvl_img_feats, feature_x_4 = self.extract_img_feat(imgs) # list of [1, 1, 96, 28, 36], [1, 1, 96, 14, 18], [1, 1, 96, 7, 9]
-        
-        if self.flag_depthbranch:
+        # 使用depth anything v2预测深度
+        if self.flag_depthbranch: # True
             if self.flag_depthanything_as_gt:
                 # depth branch
                 self.depthanything.eval()
-                image_ = metas[0]['img_depthbranch']
-                depth_pred = self.depthanything.infer_image(image_, 480, 640, 480)
+                image_ = metas[0]['img_depthbranch']    # (1 3 490 644)
+                depth_pred = self.depthanything.infer_image(image_, 480, 640, 480)  # (480 640)
                 depthnet_output = depth_pred
             else:  
                 depthnet_output = None
         else:
             depthnet_output = None
-        
+
         anchor, instance_feature, depth2occ, depthnet_output_loss, predtoreturn = self.lifter(self.flag_depthbranch, self.flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas)    # b, g, c 
         anchor = self.encoder(anchor, instance_feature, mlvl_img_feats, metas) # b, g, c
-        
+
         return anchor, depth2occ, depthnet_output_loss, predtoreturn
-    
+
     def forward(
         self,
         imgs=None,
@@ -179,7 +181,7 @@ class GaussianSegmentor(BaseModule):
         test_mode=False,
         **kwargs,
     ):
-        B, F, N, C, H, W = imgs.shape
+        B, F, N, C, H, W = imgs.shape   # (1 1 1 3 480 640)
         assert B==1, 'bs > 1 not supported'
         if grad_frames is not None:
             assert grad_frames < F
@@ -207,9 +209,9 @@ class GaussianSegmentor(BaseModule):
             output_dict=output_dict, 
             metas=metas,
             test_mode=test_mode)
-        
+
         return output_dict, depth2occ, predtoreturn
-        
+
     def frame_split(self, grad_frames, imgs, metas):
         F = imgs.shape[1]
         index = np.random.permutation(F)
@@ -227,7 +229,7 @@ class GaussianSegmentor(BaseModule):
             meta_no_grad['img_aug_matrix'] = img_aug_matrix[index[grad_frames:]]
 
         return imgs_grad, metas_grad, imgs_no_grad, metas_no_grad, inv_index
-    
+
     def forward_autoreg(self,
                         imgs=None,
                         metas=None,
@@ -238,7 +240,7 @@ class GaussianSegmentor(BaseModule):
         ):
         B, F, N, C, H, W = imgs.shape
         assert B==1, 'bs > 1 not supported'
-        
+
         bev = self.obtain_bev(imgs, metas)
         BF, G, C = bev.shape # bev is actually anchors
         bev = bev.reshape(B, F, G, C)
