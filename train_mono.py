@@ -206,9 +206,7 @@ def main(args):
                 if isinstance(data[i], torch.Tensor):
                     data[i] = data[i].cuda()
             (imgs, metas, label) = data
-
-
-
+            
             # 仅支持 bs=1 的原实现：只搬运 metas[0] 到 GPU。
             # for k, v in metas[0].items():
             #     if not (k in metas_tensor_keys_inv):

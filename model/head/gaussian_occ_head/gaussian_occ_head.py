@@ -33,10 +33,11 @@ class GaussianOccHead(BaseModule):
         self.num_classes = num_classes
         self.classes = list(range(num_classes))
 
-        sys.path.append(
-            "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/model/head/gaussian_occ_head/ops/localagg"
-        )
-        from local_aggregate import LocalAggregator
+        # sys.path.append(
+        #     "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/model/head/gaussian_occ_head/ops/localagg"
+        # )
+        # from local_aggregate import LocalAggregator
+        from model.head.gaussian_occ_head.ops.localagg.local_aggregate import LocalAggregator
         self.aggregator = LocalAggregator(**cuda_kwargs)
 
         if with_empty:
@@ -241,7 +242,7 @@ class GaussianOccHead(BaseModule):
                 CovInv[i:i+1, mask],
                 [metas[i]],
                 origin_use) # n, c
-            semantics.append(semantic)
+            semantics.append(semantic)  # (129600 13)
 
         semantics = torch.stack(semantics, dim=0).transpose(1, 2) # [1, 13, 129600]
         spatial_shape = label.shape[2:] # [60, 60, 36]

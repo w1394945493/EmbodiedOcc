@@ -181,7 +181,7 @@ class GaussianSegmentor(BaseModule):
         anchor, instance_feature, depth2occ, depthnet_output_loss, predtoreturn = self.lifter(self.flag_depthbranch, self.flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas)    # b, g, c
         anchor = self.encoder(anchor, instance_feature, mlvl_img_feats, metas) # b, g, c
 
-        return anchor, depth2occ, depthnet_output_loss, predtoreturn
+        return anchor, depth2occ, depthnet_output_loss, predtoreturn    # (2 16200 23) None None None
 
     def forward(
         self,
@@ -208,7 +208,7 @@ class GaussianSegmentor(BaseModule):
 
         # BF, H, W, C = bev.shape
         BF, G, C = bev.shape # bev is actually anchors [1, 21600, 24]
-        bev = bev.reshape(B, F, G, C)
+        bev = bev.reshape(B, F, G, C)   # (2 1 16200 23)
         if hasattr(self, 'future_decoder'):
             output_dict = self.future_decoder(bev, metas)
             bev_predict = output_dict.pop('bev')
@@ -216,9 +216,9 @@ class GaussianSegmentor(BaseModule):
             bev_predict = bev
             output_dict = dict()
         output_dict = self.head(
-            bev_feat=bev_predict,  # [1, 1, 21600, 24]
+            bev_feat=bev_predict,   # (2 1 16200 23)
             points=points,
-            label=label,
+            label=label,            # (2 1 60 60 36)
             output_dict=output_dict,
             metas=metas,
             test_mode=test_mode)
