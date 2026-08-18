@@ -136,6 +136,20 @@ class LocalAggregator(nn.Module):
         scales = scales.detach().squeeze(0)
         cov3D = cov3D.squeeze(0) # n, 3, 3
 
+        # 仅支持旧 bs=1 数据流的原实现：head 会提前把 opacity 从 [1, G, 1]
+        # flatten 为 [1, G]，所以上面的 squeeze(0) 恰好得到 CUDA 算子要求的 [G]。
+        # opacities = opacities.squeeze(0)
+        # 支持 bs>1：逐样本筛选后传入的是 [1, G_i, 1]，去掉 batch 维后仍为
+        # [G_i, 1]。local_aggregate CUDA backward 固定返回 [G_i]，因此必须在
+        # apply 前显式去掉末尾的单通道维，保证 forward 输入与 backward 梯度同形。
+        if opacities.ndim == 2 and opacities.shape[-1] == 1:
+            opacities = opacities.squeeze(-1)
+
+        assert opacities.ndim == 1, \
+            f'local_aggregate expects opacities [G], but got {tuple(opacities.shape)}'
+        assert means3D.shape[0] == opacities.shape[0] == semantics.shape[0], \
+            'means3D、opacities 和 semantics 的 Gaussian 数量必须一致'
+
         # nyu_pc_min = torch.tensor(metas[0]['vox_origin']).to(pts.device)
         nyu_pc_min = origin_use
         points_int = ((pts - nyu_pc_min) / self.grid_size).to(torch.int)
