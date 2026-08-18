@@ -2,6 +2,7 @@ import os, time, argparse, os.path as osp, numpy as np
 import torch
 import gc
 import torch.distributed as dist
+from torch.utils.data import DataLoader, Sampler
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3, 4, 5, 6, 7'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # torchrun --nproc_per_node=8 train_mono.py
@@ -37,6 +38,41 @@ def is_main_process():
     else:
         return dist.get_rank() == 0
 
+
+class DistributedEvalSampler(Sampler):
+    """将验证集无重复地划分到各进程，不像 DistributedSampler 那样补齐样本。"""
+
+    def __init__(self, dataset, rank, world_size):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self):
+        if self.rank >= len(self.dataset):
+            return 0
+        return (len(self.dataset) - 1 - self.rank) // self.world_size + 1
+
+
+def reduce_eval_metrics(metric, device):
+    """先汇总所有进程的 TP/FP/FN，再由全局计数计算指标。"""
+    completion = torch.tensor(
+        [metric.completion_tp, metric.completion_fp, metric.completion_fn],
+        dtype=torch.float64,
+        device=device,
+    )
+    semantic = torch.as_tensor(
+        np.stack([metric.tps, metric.fps, metric.fns]),
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(completion, op=dist.ReduceOp.SUM)
+    dist.all_reduce(semantic, op=dist.ReduceOp.SUM)
+    metric.completion_tp, metric.completion_fp, metric.completion_fn = completion.cpu().tolist()
+    metric.tps, metric.fps, metric.fns = semantic.cpu().numpy()
+
 def main(args):
     # global settings
     torch.backends.cudnn.benchmark = True
@@ -70,13 +106,19 @@ def main(args):
         rank = int(os.environ["RANK"])  # node id
 
         num_gpus = torch.cuda.device_count()
-        torch.cuda.set_device(rank % num_gpus)
+        if num_gpus == 0:
+            raise RuntimeError("分布式训练需要至少一张可用的 CUDA GPU")
+        # 仅支持特定启动方式的原实现：后续 DDP 使用了未定义的 gpu。
+        # gpu = rank % num_gpus
+        # 支持 torchrun 单机/多机：LOCAL_RANK 才是当前节点上的 CUDA 设备编号。
+        gpu = int(os.environ.get("LOCAL_RANK", rank % num_gpus))
+        torch.cuda.set_device(gpu)
         dist.init_process_group(
             backend="nccl",
-            # init_method=f"env://",
-            world_size=world_size,
+            init_method="env://",
         )
-        rank, world_size = get_dist_info()
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
     else:
         rank = 0
         world_size = 1
@@ -93,8 +135,13 @@ def main(args):
 
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = osp.join(args.work_dir, f'{timestamp}.log')
-    logger = MMLogger(name='indoor_nyu', log_file=log_file, log_level='INFO')
-    logger.info(f'Config:\n{cfg.pretty_text}')
+    logger = MMLogger(
+        name='indoor_nyu',
+        log_file=log_file if is_main_process() else None,
+        log_level='INFO' if is_main_process() else 'ERROR',
+    )
+    if is_main_process():
+        logger.info(f'Config:\n{cfg.pretty_text}')
 
     # build model
     from model import build_model
@@ -131,6 +178,21 @@ def main(args):
             cfg.train_loader_config,
             cfg.val_loader_config,
             dist=distributed,
+        )
+
+    if distributed:
+        # 仅支持训练用途的原实现：DistributedSampler(drop_last=False) 会在验证集
+        # 长度不能整除进程数时补入重复样本，导致最终指标有偏差。
+        # val_sampler = DistributedSampler(val_wrapper, shuffle=False, drop_last=False)
+        # 支持严格多卡评估：每个验证样本只分配给一个进程，不做补齐。
+        val_dataset_loader = DataLoader(
+            dataset=val_dataset_loader.dataset,
+            batch_size=cfg.val_loader_config["batch_size"],
+            collate_fn=val_dataset_loader.collate_fn,
+            shuffle=False,
+            sampler=DistributedEvalSampler(val_dataset_loader.dataset, rank, world_size),
+            num_workers=cfg.val_loader_config["num_workers"],
+            pin_memory=True,
         )
 
     # get optimizer, loss, scheduler
@@ -303,8 +365,13 @@ def main(args):
         # eval
         if epoch % eval_freq == 0:
             my_model.eval()
+            # 无补齐验证 sampler 可能使各进程迭代次数不同。绕过 DDP 包装层进行
+            # 纯前向，避免 DDP forward 中的 buffer 同步让先结束的进程发生死锁。
+            eval_model = my_model.module if distributed else my_model
             CalMeanIou.reset()
             loss_record = LossRecord(loss_func=loss_func)
+            val_loss_sum = 0.0
+            val_sample_count = 0
             np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
             with torch.no_grad():
                 for i_iter_val, data in enumerate(val_dataset_loader):
@@ -332,10 +399,13 @@ def main(args):
                         meta["img_depthbranch"] = meta["img_depthbranch"].to(device)
 
                     with torch.cuda.amp.autocast(enabled=amp):
-                        result_dict, my_occ, predtoreturn = my_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=None, test_mode=True)
+                        result_dict, my_occ, predtoreturn = eval_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=None, test_mode=True)
 
                     loss, loss_dict = loss_func(result_dict)
                     loss_record.update(loss=loss.item(), loss_dict=loss_dict)
+                    batch_size = imgs.shape[0]
+                    val_loss_sum += loss.item() * batch_size
+                    val_sample_count += batch_size
 
                     voxel_predict = result_dict['ce_input'].argmax(dim=1).long() # [1, 60, 60, 36]
                     voxel_label = result_dict['ce_label'].long() # [1, 60, 60, 36]
@@ -356,15 +426,63 @@ def main(args):
                     gc.collect()
                     torch.cuda.empty_cache()
 
+            if distributed:
+                reduce_eval_metrics(CalMeanIou, torch.device("cuda", gpu))
+
+                # 仅支持单进程的原实现：各进程分别计算自己的验证 loss。
+                # global_val_loss = np.mean(loss_record.total_loss)
+                # 支持多卡：按样本数归约 loss，避免不同进程 batch 数不同时产生偏差。
+                local_sample_count = torch.tensor(
+                    val_sample_count,
+                    dtype=torch.long,
+                    device=torch.device("cuda", gpu),
+                )
+                sample_counts_per_rank = [
+                    torch.zeros_like(local_sample_count) for _ in range(world_size)
+                ]
+                dist.all_gather(sample_counts_per_rank, local_sample_count)
+                sample_counts_per_rank = [
+                    count.item() for count in sample_counts_per_rank
+                ]
+                loss_and_count = torch.tensor(
+                    [val_loss_sum, val_sample_count],
+                    dtype=torch.float64,
+                    device=torch.device("cuda", gpu),
+                )
+                dist.all_reduce(loss_and_count, op=dist.ReduceOp.SUM)
+                global_val_loss = (
+                    loss_and_count[0] / loss_and_count[1].clamp_min(1)
+                ).item()
+                global_sample_count = int(loss_and_count[1].item())
+            else:
+                global_val_loss = val_loss_sum / max(val_sample_count, 1)
+                sample_counts_per_rank = [val_sample_count]
+                global_sample_count = val_sample_count
+
             stats = CalMeanIou.get_stats()
 
             info_sem_cls = stats["iou_ssc"]
             info_sem = stats["iou_ssc_mean"]
             info_geo = stats["iou"]
 
-            logger.info(f'Current val iou of sem_cls is {info_sem_cls}')
-            logger.info(f'Current val iou of sem is {info_sem}')
-            logger.info(f'Current val iou of geo is {info_geo}')
+            if is_main_process():
+                expected_sample_count = len(val_dataset_loader.dataset)
+                logger.info(
+                    "[EVAL] Samples used to calculate mIoU/IoU: "
+                    f"per-rank={sample_counts_per_rank}, "
+                    f"collected={global_sample_count}, "
+                    f"expected={expected_sample_count}"
+                )
+                if global_sample_count != expected_sample_count:
+                    logger.warning(
+                        "[EVAL] Collected sample count does not match validation "
+                        f"dataset size: {global_sample_count} != "
+                        f"{expected_sample_count}"
+                    )
+                logger.info(f'Current val loss is {global_val_loss}')
+                logger.info(f'Current val iou of sem_cls is {info_sem_cls}')
+                logger.info(f'Current val iou of sem is {info_sem}')
+                logger.info(f'Current val iou of geo is {info_geo}')
 
 
 if __name__ == '__main__':
