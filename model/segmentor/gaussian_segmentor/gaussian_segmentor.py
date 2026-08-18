@@ -32,7 +32,7 @@ class GaussianSegmentor(BaseModule):
         lifter=None,
         encoder=None,
         future_decoder=None,
-        head=None, 
+        head=None,
         init_cfg=None,
         **kwargs,
     ):
@@ -55,7 +55,7 @@ class GaussianSegmentor(BaseModule):
                 new_state_dict = {}
                 for k, v in checkpoint.items():
                     if k.startswith('module.'):
-                        new_key = k[len('module.'):] 
+                        new_key = k[len('module.'):]
                     else:
                         new_key = k
                     new_state_dict[new_key] = v
@@ -109,7 +109,7 @@ class GaussianSegmentor(BaseModule):
             self.lifter = MODELS.build(lifter)
         if encoder is not None:
             self.encoder = MODELS.build(encoder)
-        if future_decoder is not None: 
+        if future_decoder is not None:
             self.future_decoder = MODELS.build(future_decoder)
         if head is not None:
             self.head = MODELS.build(head)
@@ -140,7 +140,7 @@ class GaussianSegmentor(BaseModule):
         # list of [2560, 15, 20]
         img_feats_out = self.neck(img_feats_backbone) # dict
 
-        img_feats_reshaped = [] 
+        img_feats_reshaped = []
         for img_feat in img_feats_out.values():
             BN, C, H, W = img_feat.size()
             if W != 640:
@@ -158,15 +158,27 @@ class GaussianSegmentor(BaseModule):
             if self.flag_depthanything_as_gt:
                 # depth branch
                 self.depthanything.eval()
-                image_ = metas[0]['img_depthbranch']    # (1 3 490 644)
-                depth_pred = self.depthanything.infer_image(image_, 480, 640, 480)  # (480 640)
-                depthnet_output = depth_pred
-            else:  
+
+                # 仅支持 bs=1 的原实现：只读取 metas[0] 并生成一张深度图。
+                # image_ = metas[0]['img_depthbranch']    # (1 3 490 644)
+                # depth_pred = self.depthanything.infer_image(image_, 480, 640, 480)  # (480 640)
+                # depthnet_output = depth_pred
+
+                # 支持 bs>1：逐样本调用单图接口，再堆叠成 [B, H, W]。
+                depth_preds = []
+                for meta in metas:
+                    depth = self.depthanything.infer_image(
+                        meta["img_depthbranch"], 480, 640, 480
+                    )
+                    depth_preds.append(depth)
+                depthnet_output = torch.stack(depth_preds, dim=0)
+
+            else:
                 depthnet_output = None
         else:
             depthnet_output = None
 
-        anchor, instance_feature, depth2occ, depthnet_output_loss, predtoreturn = self.lifter(self.flag_depthbranch, self.flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas)    # b, g, c 
+        anchor, instance_feature, depth2occ, depthnet_output_loss, predtoreturn = self.lifter(self.flag_depthbranch, self.flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas)    # b, g, c
         anchor = self.encoder(anchor, instance_feature, mlvl_img_feats, metas) # b, g, c
 
         return anchor, depth2occ, depthnet_output_loss, predtoreturn
@@ -182,7 +194,8 @@ class GaussianSegmentor(BaseModule):
         **kwargs,
     ):
         B, F, N, C, H, W = imgs.shape   # (1 1 1 3 480 640)
-        assert B==1, 'bs > 1 not supported'
+        # 仅支持 bs=1 的原限制；后续 lifter/encoder/head 已保留 batch 维，因此不再执行。
+        # assert B==1, 'bs > 1 not supported'
         if grad_frames is not None:
             assert grad_frames < F
             imgs_grad, metas_grad, imgs_no_grad, metas_no_grad, inv_index = self.frame_split(grad_frames, imgs, metas)
@@ -204,9 +217,9 @@ class GaussianSegmentor(BaseModule):
             output_dict = dict()
         output_dict = self.head(
             bev_feat=bev_predict,  # [1, 1, 21600, 24]
-            points=points, 
-            label=label, 
-            output_dict=output_dict, 
+            points=points,
+            label=label,
+            output_dict=output_dict,
             metas=metas,
             test_mode=test_mode)
 
@@ -239,7 +252,8 @@ class GaussianSegmentor(BaseModule):
                         **kwargs,
         ):
         B, F, N, C, H, W = imgs.shape
-        assert B==1, 'bs > 1 not supported'
+        # 仅支持 bs=1 的原限制；保留作对照，不再执行。
+        # assert B==1, 'bs > 1 not supported'
 
         bev = self.obtain_bev(imgs, metas)
         BF, G, C = bev.shape # bev is actually anchors
@@ -248,10 +262,10 @@ class GaussianSegmentor(BaseModule):
         output_dict = self.future_decoder.forward_autoreg(bev, metas)
         bev_predict = output_dict.pop('bev')
         output_dict = self.head(
-            bev_feat=bev_predict, 
-            points=points, 
-            label=label, 
-            output_dict=output_dict, 
+            bev_feat=bev_predict,
+            points=points,
+            label=label,
+            output_dict=output_dict,
             metas=metas,
             test_mode=test_mode)
 

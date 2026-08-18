@@ -49,15 +49,25 @@ class SparseConv3D(BaseModule):
         # scene_size = metas[0]['scene_size']
         # vox_far = vox_near + scene_size
         # nyu_pc_range = torch.cat([vox_near, vox_far], dim=0).to(anchor.device)
-        nyu_pc_range = metas[0]['cam_vox_range'].to(anchor.device)
-        my_get = partial(cartesian, pc_range=nyu_pc_range)
+        # 仅支持 bs=1 的原实现：固定读取 metas[0]，并把 batch 与 Gaussian 一起展平后统一求最小值。
+        # nyu_pc_range = metas[0]['cam_vox_range'].to(anchor.device)
+        # my_get = partial(cartesian, pc_range=nyu_pc_range)
         # sparsify
         # anchor_xyz = self.get_xyz(anchor).flatten(0, 1) 
         # import pdb; pdb.set_trace()
-        anchor_xyz = my_get(anchor).flatten(0, 1) 
-        indices = anchor_xyz - anchor_xyz.min(0, keepdim=True)[0]
-        indices = indices / self.grid_size[None, :] # bg, 3
-        indices = indices.to(torch.int32)
+        # anchor_xyz = my_get(anchor).flatten(0, 1)
+        # indices = anchor_xyz - anchor_xyz.min(0, keepdim=True)[0]
+        # indices = indices / self.grid_size[None, :]
+        # indices = indices.to(torch.int32)
+        # 支持 bs>1：逐样本反归一化并逐样本平移索引，避免不同场景坐标互相影响。
+        nyu_pc_range = torch.stack([m['cam_vox_range'] for m in metas]).to(anchor.device, anchor.dtype)
+        xyz_01 = torch.sigmoid(anchor[..., :3])
+        anchor_xyz = xyz_01 * (
+            nyu_pc_range[:, None, 3:] - nyu_pc_range[:, None, :3]
+        ) + nyu_pc_range[:, None, :3]
+        indices = anchor_xyz - anchor_xyz.amin(dim=1, keepdim=True)
+        indices = (indices / self.grid_size[None, None, :]).to(torch.int32)
+        indices = indices.flatten(0, 1)
         batched_indices = torch.cat([
             torch.arange(bs, device=indices.device, dtype=torch.int32).reshape(
                 bs, 1, 1).expand(-1, g, -1).flatten(0, 1),

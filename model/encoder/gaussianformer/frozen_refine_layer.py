@@ -114,11 +114,14 @@ class SparseGaussian3DDeltaForzenRefinementModule(BaseModule):
         
         # del delta_scale, scale_final, delta_w1, delta_x1, delta_y1, delta_z1, w1, x1, y1, z1, w_final, x_final, y_final, z_final, rot_final, delta_opa, opa_final, delta_semantics, semantics_final
         
-        nyu_pc_range = metas[0]['cam_vox_range'].to(output.device)
+        # 仅支持 bs=1 的原实现：固定使用 metas[0] 的相机体素范围。
+        # nyu_pc_range = metas[0]['cam_vox_range'].to(output.device)
+        # 支持 bs>1：每个样本使用自己的相机体素范围。
+        nyu_pc_range = torch.stack([m['cam_vox_range'] for m in metas]).to(output.device, output.dtype)
         xyz = safe_sigmoid(output[..., :3])
-        xxx = xyz[..., 0] * (nyu_pc_range[3] - nyu_pc_range[0]) + nyu_pc_range[0]
-        yyy = xyz[..., 1] * (nyu_pc_range[4] - nyu_pc_range[1]) + nyu_pc_range[1]
-        zzz = xyz[..., 2] * (nyu_pc_range[5] - nyu_pc_range[2]) + nyu_pc_range[2]
+        xxx = xyz[..., 0] * (nyu_pc_range[:, None, 3] - nyu_pc_range[:, None, 0]) + nyu_pc_range[:, None, 0]
+        yyy = xyz[..., 1] * (nyu_pc_range[:, None, 4] - nyu_pc_range[:, None, 1]) + nyu_pc_range[:, None, 1]
+        zzz = xyz[..., 2] * (nyu_pc_range[:, None, 5] - nyu_pc_range[:, None, 2]) + nyu_pc_range[:, None, 2]
         xyz = torch.stack([xxx, yyy, zzz], dim=-1)
 
         gs_scales = safe_sigmoid(output[..., 3:6])

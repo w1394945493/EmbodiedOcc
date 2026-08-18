@@ -53,9 +53,9 @@ def main(args):
     # distributed = True
     # world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
     # rank = int(os.environ["RANK"])  # node id
-    # gpu = int(os.environ['LOCAL_RANK']) 
+    # gpu = int(os.environ['LOCAL_RANK'])
     # dist.init_process_group(
-    #     backend="nccl", init_method=f"env://", 
+    #     backend="nccl", init_method=f"env://",
     #     world_size=world_size, rank=rank
     # )
     # # dist.barrier()
@@ -99,10 +99,10 @@ def main(args):
     # build model
     from model import build_model
     my_model = build_model(cfg.model)
-    
+
     if cfg.flag_depthanything_as_gt: # True
         my_model.depthanything.requires_grad_(False)
-    
+
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
     logger.info(f'Number of params: {n_parameters}')
     logger.info(f'Model:\n{my_model}')
@@ -119,7 +119,7 @@ def main(args):
     else:
         my_model = my_model.cuda()
     print('done ddp model')
-    
+
     # build dataloader
     from dataset import build_dataloader
     train_dataset_loader, val_dataset_loader = \
@@ -160,7 +160,7 @@ def main(args):
         cfg.resume_from = osp.join(args.work_dir, 'latest.pth')
     if args.resume_from:
         cfg.resume_from = args.resume_from
-    
+
     print('resume from: ', cfg.resume_from)
     print('work dir: ', args.work_dir)
 
@@ -189,9 +189,9 @@ def main(args):
         except:
             state_dict = revise_ckpt_2(state_dict)
             print(my_model.load_state_dict(state_dict, strict=False))
-        
+
     metas_tensor_keys_inv = ['depth_gt_np_valid', 'depth_gt_np', 'name', 'cam2img', 'world2img', 'rgb_path', 'depth_path','num_depth', 'occ_mask_valid', 'occ_mask_valid_fov', 'img_shape', 'img_aug_matrix']
-    
+
     # training
     while epoch < max_num_epochs:
         my_model.train()
@@ -206,28 +206,41 @@ def main(args):
                 if isinstance(data[i], torch.Tensor):
                     data[i] = data[i].cuda()
             (imgs, metas, label) = data
-            
-            for k, v in metas[0].items():
-                if not (k in metas_tensor_keys_inv):
-                    metas[0][k] = torch.tensor(v).cuda()
-            metas[0]['img_depthbranch'] = metas[0]['img_depthbranch'].cuda()
-            
+
+
+
+            # 仅支持 bs=1 的原实现：只搬运 metas[0] 到 GPU。
+            # for k, v in metas[0].items():
+            #     if not (k in metas_tensor_keys_inv):
+            #         metas[0][k] = torch.tensor(v).cuda()
+            # metas[0]['img_depthbranch'] = metas[0]['img_depthbranch'].cuda()
+            # 支持 bs>1：遍历 batch 内所有 metadata，并搬到当前图像所在设备。
+            device = imgs.device
+            for meta in metas:
+                for k, v in meta.items():
+                    if k not in metas_tensor_keys_inv:
+                        if isinstance(v, torch.Tensor):
+                            meta[k] = v.to(device)
+                        else:
+                            meta[k] = torch.as_tensor(v, device=device)
+                meta["img_depthbranch"] = meta["img_depthbranch"].to(device)
+
             # forward + backward + optimize
             data_time_e = time.time()
-            
+
             with torch.cuda.amp.autocast(enabled=amp):
                 result_dict, my_occ, predtoreturn = my_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=cfg.grad_frames, test_mode=False)
-            
+
             loss, loss_dict = loss_func(result_dict)
             loss_record.update(loss=loss.item(), loss_dict=loss_dict)
-            
+
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(my_model.parameters(), cfg.grad_max_norm)
 
             valid_grad = True
-            
+
             scaler.step(optimizer)
             scaler.update()
             scheduler.step_update(global_iter)
@@ -250,10 +263,10 @@ def main(args):
                 loss_record.reset()
             data_time_s = time.time()
             time_s = time.time()
-            
+
             gc.collect()
             torch.cuda.empty_cache()
-            
+
         # save checkpoint
         if is_main_process():
             dict_to_save = {
@@ -271,7 +284,7 @@ def main(args):
             symlink(save_file_name, dst_file)
 
         epoch += 1
-        
+
         # eval
         if epoch % eval_freq == 0:
             my_model.eval()
@@ -284,43 +297,57 @@ def main(args):
                         if isinstance(data[i], torch.Tensor):
                             data[i] = data[i].cuda()
                     (imgs, metas, label) = data
-                    
-                    for k, v in metas[0].items():
-                        if not (k in metas_tensor_keys_inv):
-                            metas[0][k] = torch.tensor(v).cuda()
-                    metas[0]['img_depthbranch'] = metas[0]['img_depthbranch'].cuda()
-                    
+
+                    # 仅支持 bs=1 的原实现：验证时也只搬运 metas[0] 到 GPU。
+                    # for k, v in metas[0].items():
+                    #     if not (k in metas_tensor_keys_inv):
+                    #         metas[0][k] = torch.tensor(v).cuda()
+                    # metas[0]['img_depthbranch'] = metas[0]['img_depthbranch'].cuda()
+                    # 支持 bs>1：验证阶段同样处理 batch 内全部 metadata。
+                    device = imgs.device
+
+                    for meta in metas:
+                        for k, v in meta.items():
+                            if k not in metas_tensor_keys_inv:
+                                if isinstance(v, torch.Tensor):
+                                    meta[k] = v.to(device)
+                                else:
+                                    meta[k] = torch.as_tensor(v, device=device)
+
+                        meta["img_depthbranch"] = meta["img_depthbranch"].to(device)
+
+
                     with torch.cuda.amp.autocast(enabled=amp):
                         result_dict, my_occ, predtoreturn = my_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=None, test_mode=True)
-                    
+
                     loss, loss_dict = loss_func(result_dict)
                     loss_record.update(loss=loss.item(), loss_dict=loss_dict)
-                    
+
                     voxel_predict = result_dict['ce_input'].argmax(dim=1).long() # [1, 60, 60, 36]
                     voxel_label = result_dict['ce_label'].long() # [1, 60, 60, 36]
-                    
+
                     voxel_predict[voxel_predict == 0] = 255
                     voxel_predict[voxel_predict == 12] = 0
                     voxel_label[voxel_label == 0] = 255
                     voxel_label[voxel_label == 12] = 0
                     voxel_predict = voxel_predict.cpu()
                     voxel_label = voxel_label.cpu()
-                    
+
                     CalMeanIou.add_batch(voxel_predict, voxel_label)
-                                        
+
                     if i_iter_val % print_freq == 0 and is_main_process():
                         loss_info = loss_record.loss_info()
                         logger.info('[EVAL] Iter %5d/%d   '%(i_iter_val, len(val_dataset_loader)) + loss_info)
-                        
+
                     gc.collect()
                     torch.cuda.empty_cache()
 
             stats = CalMeanIou.get_stats()
-            
+
             info_sem_cls = stats["iou_ssc"]
             info_sem = stats["iou_ssc_mean"]
             info_geo = stats["iou"]
-            
+
             logger.info(f'Current val iou of sem_cls is {info_sem_cls}')
             logger.info(f'Current val iou of sem is {info_sem}')
             logger.info(f'Current val iou of geo is {info_geo}')

@@ -81,11 +81,14 @@ class SparseGaussian3DRefinementModule(BaseModule):
         # scene_size = metas[0]['scene_size']
         # vox_far = vox_near + scene_size
         # nyu_pc_range = torch.cat([vox_near, vox_far], dim=0).to(output.device)
-        nyu_pc_range = metas[0]['cam_vox_range'].to(output.device)
+        # 仅支持 bs=1 的原实现：所有样本共享 metas[0] 的相机体素范围。
+        # nyu_pc_range = metas[0]['cam_vox_range'].to(output.device)
+        # 支持 bs>1：堆叠每个样本的范围，并通过 [B, 1] 广播到 Gaussian 维。
+        nyu_pc_range = torch.stack([m['cam_vox_range'] for m in metas]).to(output.device, output.dtype)
         xyz = safe_sigmoid(output[..., :3])
-        xxx = xyz[..., 0] * (nyu_pc_range[3] - nyu_pc_range[0]) + nyu_pc_range[0]
-        yyy = xyz[..., 1] * (nyu_pc_range[4] - nyu_pc_range[1]) + nyu_pc_range[1]
-        zzz = xyz[..., 2] * (nyu_pc_range[5] - nyu_pc_range[2]) + nyu_pc_range[2]
+        xxx = xyz[..., 0] * (nyu_pc_range[:, None, 3] - nyu_pc_range[:, None, 0]) + nyu_pc_range[:, None, 0]
+        yyy = xyz[..., 1] * (nyu_pc_range[:, None, 4] - nyu_pc_range[:, None, 1]) + nyu_pc_range[:, None, 1]
+        zzz = xyz[..., 2] * (nyu_pc_range[:, None, 5] - nyu_pc_range[:, None, 2]) + nyu_pc_range[:, None, 2]
         xyz = torch.stack([xxx, yyy, zzz], dim=-1)
 
         gs_scales = safe_sigmoid(output[..., 3:6])

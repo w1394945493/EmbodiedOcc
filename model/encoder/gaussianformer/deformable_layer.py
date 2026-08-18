@@ -78,27 +78,43 @@ class DeformableFeatureAggregation(BaseModule):
             ida_mat.append(meta['img_aug_matrix'])
             image_wh.append(meta['img_shape'])
         
-        projection_mat = torch.from_numpy(np.array(
-            projection_mat)).to(tensor.device, tensor.dtype)[0]
-        ida_mat = torch.from_numpy(np.array(
-            ida_mat)).to(tensor.device, tensor.dtype)[0]
+        # 仅支持 bs=1 的原实现：索引 [0] 会直接丢弃 metadata 的 batch 维。
+        # projection_mat = torch.from_numpy(np.array(
+        #     projection_mat)).to(tensor.device, tensor.dtype)[0]
+        # ida_mat = torch.from_numpy(np.array(
+        #     ida_mat)).to(tensor.device, tensor.dtype)[0]
+        # 支持 bs>1：保留 batch 维，并把可能存在的 frame 维合并到 batch。
+        projection_mat = torch.as_tensor(
+            np.asarray(projection_mat), device=tensor.device, dtype=tensor.dtype)
+        ida_mat = torch.as_tensor(
+            np.asarray(ida_mat), device=tensor.device, dtype=tensor.dtype)
+        projection_mat = projection_mat.reshape(-1, self.num_cams, 4, 4)
+        ida_mat = ida_mat.reshape(-1, self.num_cams, 4, 4)
         ida_mat[..., :2, 2] = ida_mat[..., :2, 3]
         ida_mat[..., :2, 3] = 0.
         
         projection_mat = torch.matmul(ida_mat, projection_mat) # matmul([1, 1, 4, 4], [4, 4])
         bs, N = projection_mat.shape[:2]
-        image_wh = torch.from_numpy(np.array(
-            image_wh)).to(tensor.device, tensor.dtype) # [224, 288, 3]
-        image_wh = image_wh[0].unflatten(0, (bs, N))[..., [1, 0]] # [288., 224.]
+        image_wh = torch.as_tensor(
+            np.asarray(image_wh), device=tensor.device, dtype=tensor.dtype)
+        # 仅支持 bs=1 的原实现：image_wh[0] 只保留第一个样本。
+        # image_wh = image_wh[0].unflatten(0, (bs, N))[..., [1, 0]]
+        # 支持 bs>1：整理为 [B, N, 2]，分别保存每个样本/相机的宽高。
+        image_wh = image_wh.reshape(bs, N, -1)[..., :2][..., [1, 0]]
 
         meta_dict.update({
             'projection_mat': projection_mat,
             'image_wh': image_wh,
             # 'vox_origin': torch.tensor(metas[0]['vox_origin']).to(tensor.device, tensor.dtype),
             # 'scene_size': torch.tensor(metas[0]['scene_size']).to(tensor.device, tensor.dtype)}
-            'vox_origin': metas[0]['vox_origin'].to(tensor.dtype),
-            'scene_size': metas[0]['scene_size'].to(tensor.dtype),
-            'cam_vox_range': metas[0]['cam_vox_range'].to(tensor.dtype)}
+            # 仅支持 bs=1 的原实现：以下三个字段均固定读取 metas[0]。
+            # 'vox_origin': metas[0]['vox_origin'].to(tensor.dtype),
+            # 'scene_size': metas[0]['scene_size'].to(tensor.dtype),
+            # 'cam_vox_range': metas[0]['cam_vox_range'].to(tensor.dtype),
+            # 支持 bs>1：每个 batch 元素保留自己的场景和相机体素范围。
+            'vox_origin': torch.stack([m['vox_origin'] for m in metas]).to(tensor.device, tensor.dtype),
+            'scene_size': torch.stack([m['scene_size'] for m in metas]).to(tensor.device, tensor.dtype),
+            'cam_vox_range': torch.stack([m['cam_vox_range'] for m in metas]).to(tensor.device, tensor.dtype)}
         )
         return meta_dict
 
@@ -324,9 +340,14 @@ class SparseGaussian3DKeyPointsGenerator(BaseModule):
         # vox_far = vox_near + scene_size
         # nyu_pc_range = torch.cat([vox_near, vox_far], dim=0).to(xyz.device)
         nyu_pc_range = metas['cam_vox_range'].to(xyz.device)
-        xxx = xyz[..., 0] * (nyu_pc_range[3] - nyu_pc_range[0]) + nyu_pc_range[0]
-        yyy = xyz[..., 1] * (nyu_pc_range[4] - nyu_pc_range[1]) + nyu_pc_range[1]
-        zzz = xyz[..., 2] * (nyu_pc_range[5] - nyu_pc_range[2]) + nyu_pc_range[2]
+        # 仅支持 bs=1 的原实现：nyu_pc_range 被当成无 batch 的 [6] 使用。
+        # xxx = xyz[..., 0] * (nyu_pc_range[3] - nyu_pc_range[0]) + nyu_pc_range[0]
+        # yyy = xyz[..., 1] * (nyu_pc_range[4] - nyu_pc_range[1]) + nyu_pc_range[1]
+        # zzz = xyz[..., 2] * (nyu_pc_range[5] - nyu_pc_range[2]) + nyu_pc_range[2]
+        # 支持 bs>1：nyu_pc_range 为 [B, 6]，沿 Gaussian 维广播。
+        xxx = xyz[..., 0] * (nyu_pc_range[:, None, 3] - nyu_pc_range[:, None, 0]) + nyu_pc_range[:, None, 0]
+        yyy = xyz[..., 1] * (nyu_pc_range[:, None, 4] - nyu_pc_range[:, None, 1]) + nyu_pc_range[:, None, 1]
+        zzz = xyz[..., 2] * (nyu_pc_range[:, None, 5] - nyu_pc_range[:, None, 2]) + nyu_pc_range[:, None, 2]
         xyz = torch.stack([xxx, yyy, zzz], dim=-1) # [1, 21600, 3]
         
         key_points = key_points + xyz.unsqueeze(2)

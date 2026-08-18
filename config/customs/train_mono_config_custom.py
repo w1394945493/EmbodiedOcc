@@ -238,13 +238,17 @@ val_wrapper_config = dict(
 )
 
 train_loader_config = dict(
-    batch_size = 1,
+    # 仅支持 bs=1 的原配置：batch_size = 1
+    # 支持 bs>1：先使用 2 验证显存占用和数值正确性。
+    batch_size = 2,
     shuffle = True,
     num_workers = 0,
 )
 
 val_loader_config = dict(
-    batch_size = 1,
+    # 仅支持 bs=1 的原配置：batch_size = 1
+    # 支持 bs>1：验证路径也覆盖多样本 batch。
+    batch_size = 2,
     shuffle = False,
     num_workers = 0,
 )
