@@ -100,7 +100,10 @@ class FocalLoss(BaseLoss):
         # c = self.c[None, :, :, None].repeat(B, 1, 1, D).reshape(-1)
         c = torch.ones_like(target).reshape(-1).cuda() # 129600
         
-        visible_mask = (((target!=self.ignore_label).squeeze(0)) & fov_mask).reshape(-1).nonzero().squeeze(-1)
+        # 仅支持 bs=1 的原实现：squeeze(0) 假定 batch 维恒为 1。
+        # visible_mask = (((target!=self.ignore_label).squeeze(0)) & fov_mask).reshape(-1).nonzero().squeeze(-1)
+        # 支持 bs>1：target 与 fov_mask 均为 [B, X, Y, Z]，展平后索引全部样本。
+        visible_mask = ((target != self.ignore_label) & fov_mask.bool()).reshape(-1).nonzero().squeeze(-1)
         weight_mask = self.cls_weight[None,:] * c[visible_mask, None]
         # visible_mask[:, None]
 

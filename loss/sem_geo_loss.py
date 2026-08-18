@@ -154,7 +154,11 @@ class Geo_Scal_Loss(BaseLoss):
         nonempty_probs = 1 - empty_probs
 
         # Remove unknown voxels
-        mask = (((ssc_target != self.ignore_label).squeeze(0)) & fov_mask).unsqueeze(0)
+        # 仅支持 bs=1 的原实现：先 squeeze(0) 再 unsqueeze(0)，当 B>1 时
+        # squeeze 不生效，最终会产生 [1, B, X, Y, Z] 的五维 mask。
+        # mask = (((ssc_target != self.ignore_label).squeeze(0)) & fov_mask).unsqueeze(0)
+        # 支持 bs>1：target 与 fov_mask 都保持 [B, X, Y, Z]，直接逐元素取交集。
+        mask = (ssc_target != self.ignore_label) & fov_mask.bool()
         nonempty_target = ssc_target != self.empty_idx
         nonempty_target = nonempty_target[mask].float()
         nonempty_probs = nonempty_probs[mask]
@@ -198,7 +202,10 @@ class Sem_Scal_Loss(BaseLoss):
         pred = F.softmax(pred, dim=1)
         loss = 0
         count = 0
-        mask = (((ssc_target != self.ignore_label).squeeze(0)) & fov_mask).unsqueeze(0)
+        # 仅支持 bs=1 的原实现：额外 squeeze/unsqueeze 会在 B>1 时生成五维 mask。
+        # mask = (((ssc_target != self.ignore_label).squeeze(0)) & fov_mask).unsqueeze(0)
+        # 支持 bs>1：保持 prediction、target、FOV mask 的 batch 维一致。
+        mask = (ssc_target != self.ignore_label) & fov_mask.bool()
         n_classes = pred.shape[1]
         
         for i in range(self.sem_cls_range[0], self.sem_cls_range[1]):
