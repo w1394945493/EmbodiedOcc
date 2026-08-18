@@ -35,7 +35,7 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
 
         self.occscannet_root = data_path
         self.phase = phase
-        
+
         self.num_frames = num_frames
         self.offset = offset
         self.grid_size_occ = grid_size_occ
@@ -54,9 +54,9 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
             self.used_subscenes = f.readlines()
             for i in range(len(self.used_subscenes)):
                 self.used_subscenes[i] = f'{self.occscannet_root}/' + self.used_subscenes[i].strip()
-        
+
         self.num_pts = num_pts
-        
+
         self.normalize_rgb = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -73,10 +73,10 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         name = self.used_subscenes[index]
         with open(name, 'rb') as f:
             data = pickle.load(f)
-        
+
         name_without_ext = os.path.splitext(name)[0]
         this_name = name_without_ext.split('gathered_data/')[-1]
-        
+
         meta = {}
         meta['name'] = this_name # 'scene0000_00/00000'
         meta['scene_size'] = self.scene_size
@@ -84,12 +84,12 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         meta['cam2world'] = cam_pose
         world2cam = np.linalg.inv(cam_pose)
         meta['world2cam'] = world2cam
-        
+
         rgb_path = f'{self.occscannet_root}/posed_images/' + f'{this_name}.jpg'
         depth_path = f'{self.occscannet_root}/posed_images/' + f'{this_name}.png'
         depth_gt_np = Image.open(depth_path).convert('I;16')
         depth_gt_np = np.array(depth_gt_np) / 1000.0
-        
+
         transform = Compose([
             Resize(
                 width=480,
@@ -114,7 +114,7 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         depth_gt_np[depth_valid_mask == 0] = 0
         meta['img_depthbranch'] = img_depthbranch
         meta['depth_gt_np_valid'] = depth_gt_np
-        
+
         meta['rgb_path'] = rgb_path
         N_img = []
         this_img = imread(rgb_path, 'unchanged').astype(np.float32)
@@ -128,20 +128,20 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         img = np.stack(N_img, 0) # [1, 968, 1296, 3]
         this_H, this_W= new_H, new_W
         img = [img] # [1, 1, 968, 1296, 3]
-        
+
         cam_intrin = data['intrinsic']
         cam_intrin[0, 0] *= W_factor
         cam_intrin[0, 2] *= W_factor
         cam_intrin[1, 1] *= H_factor
         cam_intrin[1, 2] *= H_factor
-        
+
         meta['cam_k'] = cam_intrin[:3, :3]
         viewpad = np.eye(4)
         viewpad[:meta['cam_k'].shape[0], :meta['cam_k'].shape[1]] = meta['cam_k']
         meta['cam2img'] = viewpad
         world2img = (viewpad @ world2cam)
         meta['world2img'] = world2img
-        
+
         meta['depth_path'] = depth_path
         depth_gt = Image.open(depth_path).convert('I;16')
         depth_gt = np.array(depth_gt) / 1000.0
@@ -157,7 +157,7 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         occ = target # (60, 60, 36)
         nonemptymask = (occ != 12)
         occ = [occ] # [1, 60, 60, 36]
-        
+
         # compute the 3D-2D mapping
         projected_pix, fov_mask, pix_z, occ_xyz = vox2pix(
             world2cam,
@@ -182,15 +182,15 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         meta['projected_pix'] = projected_pix
         meta['fov_mask'] = fov_mask.reshape(60, 60, 36)
         meta['fov_mask_4'] = fov_mask_4.reshape(15, 15, 9)
-        
+
         meta['pix_z'] = pix_z
         meta['occ_xyz'] = occ_xyz.reshape(60, 60, 36, 3)
-        
+
         vox_near = meta['vox_origin']
         vox_far = vox_near + meta['scene_size']
         nyu_pc_range = np.concatenate([vox_near, vox_far], axis=0)
         meta['nyu_pc_range'] = nyu_pc_range
-        
+
         scan = meta['occ_xyz'][nonemptymask]
         meta['occ_xyz_nonempty'] = scan
         meta['num_depth'] = self.num_pts
@@ -205,18 +205,18 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
             scan = np.concatenate([scan, scan_], 0)
         else:
             scan = scan[np.random.choice(scan.shape[0], self.num_pts, False)]
-        
+
         scan[:, 0] = (scan[:, 0] - nyu_pc_range[0]) / (nyu_pc_range[3] - nyu_pc_range[0])
         scan[:, 1] = (scan[:, 1] - nyu_pc_range[1]) / (nyu_pc_range[4] - nyu_pc_range[1])
         scan[:, 2] = (scan[:, 2] - nyu_pc_range[2]) / (nyu_pc_range[5] - nyu_pc_range[2])
-        
+
         meta['anchor_points'] = scan
-        
+
         cam_vox_near = np.array([-5, -6, -3])
         cam_vox_far = np.array([5, 6, 8])
         cam_vox_range = np.concatenate([cam_vox_near, cam_vox_far], axis=0).astype(np.float32)
         meta['cam_vox_range'] = cam_vox_range
-        
+
         meta['occ_mask_valid'] = (occ != 0)
         meta['occ_mask_valid_fov'] = (occ != 0) & fov_mask
         meta['label'] = occ
@@ -227,7 +227,7 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
 
     def get_meshgrid(self, ranges, grid, reso):
         pass
-    
+
     def get_data_info(self, info):
         pass
 

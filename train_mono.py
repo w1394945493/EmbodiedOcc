@@ -48,6 +48,7 @@ def main(args):
     max_num_epochs = cfg.max_epochs
     eval_freq = cfg.eval_freq
     print_freq = cfg.print_freq
+    save_freq = cfg.get("save_freq", 1)  # 每隔几个epoch保存一次model
 
     # # init DDP
     # distributed = True
@@ -94,7 +95,6 @@ def main(args):
     log_file = osp.join(args.work_dir, f'{timestamp}.log')
     logger = MMLogger(name='indoor_nyu', log_file=log_file, log_level='INFO')
     logger.info(f'Config:\n{cfg.pretty_text}')
-
 
     # build model
     from model import build_model
@@ -206,7 +206,7 @@ def main(args):
                 if isinstance(data[i], torch.Tensor):
                     data[i] = data[i].cuda()
             (imgs, metas, label) = data
-            
+
             # 仅支持 bs=1 的原实现：只搬运 metas[0] 到 GPU。
             # for k, v in metas[0].items():
             #     if not (k in metas_tensor_keys_inv):
@@ -256,8 +256,22 @@ def main(args):
             if i_iter % print_freq == 0 and is_main_process():
                 lr = optimizer.param_groups[0]['lr']
                 loss_info = loss_record.loss_info()
-                logger.info('[TRAIN] Epoch %d Iter %5d/%d   ' % (epoch+1, i_iter, len(train_dataset_loader)) + loss_info +
-                            'GradNorm: %.3f,   lr: %.7f,   time: %.3f (%.3f)' % (grad_norm, lr, time_e - time_s, data_time_e - data_time_s))
+                
+                # logger.info('[TRAIN] Epoch %d Iter %5d/%d   ' % (epoch+1, i_iter, len(train_dataset_loader)) + loss_info +
+                #             'GradNorm: %.3f,   lr: %.7f,   time: %.3f (%.3f)' % (grad_norm, lr, time_e - time_s, data_time_e - data_time_s))
+                logger.info(
+                    "[TRAIN] Epoch %d Iter %5d/%d   "
+                    % (epoch + 1, i_iter, len(train_dataset_loader))
+                    + loss_info
+                    + "GradNorm: %.3f,   lr: %.7f,   memory: %.2f GB,   time: %.3f (%.3f)"
+                    % (
+                        grad_norm,
+                        lr,
+                        torch.cuda.memory_allocated() / 1024**3,
+                        time_e - time_s,
+                        data_time_e - data_time_s,
+                    )
+                )
                 loss_record.reset()
             data_time_s = time.time()
             time_s = time.time()
@@ -276,10 +290,13 @@ def main(args):
                 'best_val_iou': best_val_iou,
                 'best_val_miou': best_val_miou
             }
-            save_file_name = os.path.join(os.path.abspath(args.work_dir), f'epoch_{epoch+1}.pth')
-            torch.save(dict_to_save, save_file_name)
-            dst_file = osp.join(args.work_dir, 'latest.pth')
-            symlink(save_file_name, dst_file)
+
+            dst_file = osp.join(args.work_dir, "latest.pth")
+            torch.save(dict_to_save, dst_file)
+
+            if (epoch + 1) % save_freq == 0:
+                save_file_name = os.path.join(os.path.abspath(args.work_dir), f'epoch_{epoch+1}.pth')
+                torch.save(dict_to_save, save_file_name)
 
         epoch += 1
 
@@ -313,7 +330,6 @@ def main(args):
                                     meta[k] = torch.as_tensor(v, device=device)
 
                         meta["img_depthbranch"] = meta["img_depthbranch"].to(device)
-
 
                     with torch.cuda.amp.autocast(enabled=amp):
                         result_dict, my_occ, predtoreturn = my_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=None, test_mode=True)
