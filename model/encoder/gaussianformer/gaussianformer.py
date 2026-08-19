@@ -115,6 +115,9 @@ class SparseGaussianFormer(BaseModule):
         metas: dict,
     ):
         
+        # *【单帧流程 4：GaussianFormer 输入】
+        # * anchor 是相机局部显式参数，instance_feature 已含 Depth Anything 提示，
+        # * feature_maps 是当前帧 EfficientNet 多尺度特征；没有历史 query/feature。
         if DAF is not None:
             feature_maps = DAF.feature_maps_format(feature_maps)
 
@@ -122,9 +125,13 @@ class SparseGaussianFormer(BaseModule):
             feature_maps = [feature_maps]
         anchor_embed = self.anchor_encoder(anchor) # [1, 21600, 96]
 
+        # 配置 num_decoder=3，每个 refine 产生一版新 anchor；但函数最后只返回
+        # prediction[-1]，因此只有第三层 Gaussian 进入 Occ head 接受直接监督。
         prediction = []
         for i, op in enumerate(self.operation_order):
             if op == 'spconv':
+                # *【4.2 Gaussian-Gaussian 交互】对三维空间相邻 query 做稀疏卷积；
+                # * 第一层 operation_order 无 spconv，第二、三层才执行该操作。
                 instance_feature = self.layers[i](
                     instance_feature,
                     anchor,
@@ -136,6 +143,8 @@ class SparseGaussianFormer(BaseModule):
             elif op == "add":
                 instance_feature = instance_feature + identity
             elif op == "deformable":
+                # *【4.1 Gaussian-图像交互】由 anchor 生成三维关键点并投影到当前
+                # * RGB 的多尺度 feature map，把采样到的外观证据写回 query。
                 # assert feature_queue is None and meta_queue is None and self.depth_module is None
                 instance_feature = self.layers[i](
                     instance_feature,
@@ -145,6 +154,8 @@ class SparseGaussianFormer(BaseModule):
                     metas,
                 )
             elif "refine" in op:
+                # *【4.3 显式属性更新】根据 query 预测位置、尺度、旋转、opacity
+                # * 和 semantic 增量，生成当前 Decoder 层的新 Gaussian anchor。
                 anchor, gaussian, cls = self.layers[i](
                     instance_feature,
                     anchor,
@@ -158,4 +169,5 @@ class SparseGaussianFormer(BaseModule):
             else:
                 raise NotImplementedError(f"{op} is not supported.")
 
+        # *【单帧流程 4 输出】只将最后一层 Gaussian 交给 Occupancy head。
         return prediction[-1]

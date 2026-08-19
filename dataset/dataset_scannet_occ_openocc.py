@@ -72,6 +72,10 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         return len(self.used_subscenes)
 
     def __getitem__(self, index):
+        # *【单帧流程 0：读取一个局部 Occupancy 样本】
+        # * train_mono 配置 num_frames=1，因此一个 index 对应 ScanNet 场景中的
+        # * 一个相机时间步：读取 RGB、深度、相机参数和 60x60x36 局部体素标签；
+        # * 这里不会读取或缓存历史帧。
         name = self.used_subscenes[index]
         with open(name, 'rb') as f:
             data = pickle.load(f)
@@ -83,6 +87,8 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         meta['name'] = this_name # 'scene0000_00/00000'
         meta['scene_size'] = self.scene_size
         cam_pose = data['cam_pose']
+        # cam2world/world2cam 后续用于初始化 Gaussian、投影查询图像以及把最终
+        # Gaussian 转回世界坐标，是两条 RGB 分支共享的几何标定。
         meta['cam2world'] = cam_pose
         world2cam = np.linalg.inv(cam_pose)
         meta['world2cam'] = world2cam
@@ -92,7 +98,18 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         depth_gt_np = Image.open(depth_path).convert('I;16')
         depth_gt_np = np.array(depth_gt_np) / 1000.0
 
+        # ================================================================ #
+        # 第二条 RGB 输入：专供冻结的 Depth Anything 深度分支。
+        # 它与下方 N_img 使用的是同一个 rgb_path，但采用 Depth Anything 自己的
+        # Resize/Normalize/PrepareForNet 预处理，并作为 meta['img_depthbranch']
+        # 单独传给模型；不会作为 GaussianFormer 的多尺度视觉特征输入。
+        # ================================================================ #
         transform = Compose([
+            # *【Depth 分支网络输入尺寸】这里的 width/height=480 不是强制输出
+            # * 480x480。keep_aspect_ratio=True 会保持前面 640:480 的宽高比，
+            # * resize_method='lower_bound' 保证两边不小于 480；随后
+            # * ensure_multiple_of=14 将宽高调整到 ViT patch size 14 的整数倍。
+            # * 因而当前 480x640 图像实际会变成 HxW=490x644，再输入 Depth Anything。
             Resize(
                 width=480,
                 height=480,
@@ -106,21 +123,36 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
             PrepareForNet(),
         ])
         img_depthbranch = cv2.imread(rgb_path)
+        # *【Depth 分支尺寸流-第1步】先把原始 RGB 显式缩放成 HxW=480x640。
         img_depthbranch = cv2.resize(img_depthbranch, (640, 480), interpolation=cv2.INTER_NEAREST)
         img_depthbranch = cv2.cvtColor(img_depthbranch, cv2.COLOR_BGR2RGB) / 255.0
+        # *【Depth 分支尺寸流-第2步】执行上面的 Depth Anything 专用 Resize 后，
+        # * sample['image'] 为 CHW=3x490x644，而不是 3x480x640。
         sample = transform({'image': img_depthbranch, 'depth': depth_gt_np})
         img_depthbranch = torch.from_numpy(sample['image']).unsqueeze(0)
         depth_gt_np = torch.from_numpy(sample['depth']).unsqueeze(0)
         meta['depth_gt_np'] = depth_gt_np
         depth_valid_mask = (torch.isnan(depth_gt_np) == 0)
         depth_gt_np[depth_valid_mask == 0] = 0
+        # train_mono.py 会把该 Tensor 搬到 GPU；GaussianSegmentor.obtain_bev()
+        # 随后将它送入 depthanything.infer_image() 得到当前帧深度先验。
         meta['img_depthbranch'] = img_depthbranch
         meta['depth_gt_np_valid'] = depth_gt_np
 
         meta['rgb_path'] = rgb_path
+        # ================================================================ #
+        # 第一条 RGB 输入：主视觉/Gaussian Occupancy 分支。
+        # 该图像会作为 dataset 返回值 imgs，随后再经过 DatasetWrapper 的图像增强
+        # 与归一化，并输入 EfficientNet-B7 + DecoderBN 提取多尺度视觉特征。
+        # 注意两条分支源于同一 RGB 文件，但分别维护输入，预处理并不完全相同。
+        # ================================================================ #
         N_img = []
         this_img = imread(rgb_path, 'unchanged').astype(np.float32)
         this_H, this_W, _ = this_img.shape
+        # *【主视觉分支网络输入尺寸】主分支直接将同一张 RGB 缩放成
+        # * HxW=480x640；后续 DatasetWrapper 的 final_dim 也是 [480,640]，
+        # * 且 480/640 均可被 padding divisor=32 整除，因此 EfficientNet 最终
+        # * 实际接收到的仍是 480x640，不会像 Depth 分支那样变成 490x644。
         new_H, new_W = 480, 640
         # resize
         new_img = cv2.resize(this_img, (new_W, new_H))

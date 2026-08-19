@@ -41,7 +41,12 @@ class GaussianSegmentor(BaseModule):
         self.flag_depthanything_as_gt = flag_depthanything_as_gt
         if flag_depthbranch:
             if flag_depthanything_as_gt:
-                # depth branch
+                # ======================================================== #
+                # 第二条 RGB 分支：Depth Anything V2 几何先验分支。
+                # 输入来自 meta['img_depthbranch']，输出是一张单目深度图。它不负责
+                # 提供 GaussianFormer 的图像 feature map，也不直接产生 Gaussian；
+                # 深度图会在 GaussianNewLifter 中按 anchor 投影位置被查询。
+                # ======================================================== #
                 model_configs = {
                     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
                     'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
@@ -61,6 +66,13 @@ class GaussianSegmentor(BaseModule):
                     new_state_dict[new_key] = v
                 self.depthanything.load_state_dict(new_state_dict)
 
+            # ============================================================ #
+            # 第一条 RGB 分支：EfficientNet-B7 + DecoderBN 主视觉分支。
+            # 输入是 train_mono.py 传入的 imgs，输出四尺度 96 维特征，供
+            # GaussianFormer 根据 Gaussian 投影位置做 deformable feature sampling。
+            # 该分支和 Depth Anything 是两套独立网络，只在 lifter/encoder 阶段
+            # 通过“深度增强的 query + 多尺度图像特征”间接汇合。
+            # ============================================================ #
             basemodel_name = "tf_efficientnet_b7_ns"
             num_features = 2560
             print("Loading base model ()...".format(basemodel_name), end="")
@@ -115,7 +127,14 @@ class GaussianSegmentor(BaseModule):
             self.head = MODELS.build(head)
 
     def extract_img_feat(self, imgs):
+        """第一条 RGB 分支：从主输入 imgs 提取 GaussianFormer 使用的视觉特征。
+
+        返回的 mlvl features 会在三层 SparseGaussianFormer 中被 Gaussian query
+        投影采样；返回值不是深度图，也不会送入 Depth Anything。
+        """
         # Downloading: "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b7-dcc49843.pth" to /home/wyq/.cache/torch/hub/checkpoints/efficientnet-b7-dcc49843.pth
+        # *【主视觉分支实际输入】默认单帧配置下 imgs 为 [B,1,3,480,640]；
+        # * 这里展平相机维后，EfficientNet 接收到 [B,3,480,640]。
         B, N, C, H, W = imgs.size()
         imgs = imgs.reshape(B * N, C, H, W) # 1, 3, 480, 640
 
@@ -149,11 +168,27 @@ class GaussianSegmentor(BaseModule):
         return img_feats_reshaped, img_feats_out['1_1'] # 4:(1 1 96 240 320) (1 1 96 120 160) (1 1 96 60 80) (1 1 96 30 40); (1 96 480 640)
 
     def obtain_bev(self, imgs, metas):
+        """由单帧 RGB 构造并细化稀疏 Gaussian。
+
+        函数名保留为 obtain_bev，但返回的不是二维 BEV feature，而是最终一层
+        Gaussian 参数 [B*F,G,C]；双 RGB 分支、深度注入和 GaussianFormer 在此串联。
+        """
         B, F, N, C, H, W = imgs.shape
         imgs = imgs.reshape(B*F, N, C, H, W)
-        # 使用efficient net提取图像特征
+        # *【单帧流程 2：同一 RGB 的双分支特征提取】
+        # ================================================================ #
+        # 两条 RGB 分支在这里并行产生互补信息：
+        #   分支一 imgs -> EfficientNet/DecoderBN -> mlvl_img_feats（视觉外观）；
+        #   分支二 meta['img_depthbranch'] -> Depth Anything -> depthnet_output
+        #          （逐像素几何深度）。
+        # 两者源于同一帧 RGB，但数据预处理、网络权重和下游用途不同。
+        # ================================================================ #
+
+        # 分支一：主视觉特征。后面的 encoder 会反复从 mlvl_img_feats 投影采样。
         mlvl_img_feats, feature_x_4 = self.extract_img_feat(imgs) # list of [1, 1, 96, 28, 36], [1, 1, 96, 14, 18], [1, 1, 96, 7, 9]
-        # 使用depth anything v2预测深度
+
+        # 分支二：用冻结的 Depth Anything V2 预测当前帧深度。这里刻意读取
+        # metas 内的专用输入，而不是上面经过主分支增强/归一化后的 imgs。
         if self.flag_depthbranch: # True
             if self.flag_depthanything_as_gt:
                 # depth branch
@@ -164,9 +199,16 @@ class GaussianSegmentor(BaseModule):
                 # depth_pred = self.depthanything.infer_image(image_, 480, 640, 480)  # (480 640)
                 # depthnet_output = depth_pred
 
-                # 支持 bs>1：逐样本调用单图接口，再堆叠成 [B, H, W]。
+                # 支持 bs>1：逐样本调用单图接口，再堆叠成 [B,H,W] 深度图。
+                # train_mono.py 已将 Depth Anything 参数冻结；这里再设 eval()，保证
+                # 即使外层 model.train()，该几何先验网络仍使用固定推理行为。
                 depth_preds = []
                 for meta in metas:
+                    # *【Depth 分支输入与输出尺寸】meta['img_depthbranch'] 已由 Dataset
+                    # * 预处理为 [1,3,490,644]，这是 Depth Anything 的真实网络输入。
+                    # * 这里额外传入 h_=480、w_=640；metric-depth 版本的 infer_image
+                    # * 会在网络预测后用双线性插值把深度恢复成 [480,640]，所以 lifter
+                    # * 可以使用主图像的 480x640 像素坐标查询深度。
                     depth = self.depthanything.infer_image(
                         meta["img_depthbranch"], 480, 640, 480
                     )
@@ -178,7 +220,22 @@ class GaussianSegmentor(BaseModule):
         else:
             depthnet_output = None
 
+        # ------------------------- 两条分支的首次汇合 ----------------------
+        # lifter 不会把深度图拼到图像 feature map：它把每个初始 Gaussian 投影到
+        # depthnet_output 上查询表面深度，将其编码进 instance_feature/query。
+        # mlvl_img_feats 主要用于确定 batch，并原样继续传给下方 encoder。
+        # *【单帧流程 3：Lifter 初始化 depth-aware Gaussian query】
+        # * 固定 anchor 根据场景/相机重新定位；每个候选再从深度图查询表面深度，
+        # * 将几何提示编码进 instance_feature。
         anchor, instance_feature, depth2occ, depthnet_output_loss, predtoreturn = self.lifter(self.flag_depthbranch, self.flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas)    # b, g, c
+
+        # ------------------------- 两条分支的联合利用 ----------------------
+        # encoder 接收“含深度先验的 instance_feature”和“主视觉多尺度特征”，
+        # Gaussian query 一边携带深度提示，一边从当前 RGB feature map 采样外观信息，
+        # 经过 deformable aggregation / FFN / refinement 更新显式 Gaussian。
+        # *【单帧流程 4：三层 GaussianFormer 细化】
+        # * 深度增强 query 从主 RGB 多尺度特征采样，并经 SparseConv/FFN/refine
+        # * 更新显式 Gaussian 的位置、尺度、旋转、opacity 和语义。
         anchor = self.encoder(anchor, instance_feature, mlvl_img_feats, metas) # b, g, c
 
         return anchor, depth2occ, depthnet_output_loss, predtoreturn    # (2 16200 23) None None None
@@ -193,6 +250,8 @@ class GaussianSegmentor(BaseModule):
         test_mode=False,
         **kwargs,
     ):
+        # *【单帧流程总入口】默认 [B,F=1,N=1,3,480,640]。F 只是通用接口维度；
+        # * train_mono 不传播任何跨帧状态，所以这是严格单帧模型。
         B, F, N, C, H, W = imgs.shape   # (1 1 1 3 480 640)
         # 仅支持 bs=1 的原限制；后续 lifter/encoder/head 已保留 batch 维，因此不再执行。
         # assert B==1, 'bs > 1 not supported'
@@ -215,6 +274,9 @@ class GaussianSegmentor(BaseModule):
         else:
             bev_predict = bev
             output_dict = dict()
+        # *【单帧流程 5～7：Gaussian 解码与体素聚合】
+        # * 最终 anchor 解码为显式 Gaussian、变到世界坐标，然后在当前局部
+        # * 60x60x36 体素中心聚合成语义 Occupancy logits。
         output_dict = self.head(
             bev_feat=bev_predict,   # (2 1 16200 23)
             points=points,

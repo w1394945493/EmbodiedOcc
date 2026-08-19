@@ -16,6 +16,8 @@ class Scannet_Scene_Occ_DatasetWrapper(data.Dataset):
         self.phase = phase
         if phase == 'train':
             transforms = [
+                # *【主视觉分支尺寸确认】配置 final_dim=[480,640]，所以 imgs 在这里
+                # * 被整理为 HxW=480x640；该变换不作用于 meta['img_depthbranch']。
                 ImageAug3D(final_dim=final_dim, resize_lim=resize_lim, is_train=True),
                 PhotoMetricDistortionMultiViewImage(),
                 NormalizeMultiviewImage(**img_norm_cfg),
@@ -23,8 +25,10 @@ class Scannet_Scene_Occ_DatasetWrapper(data.Dataset):
             ]
         else:
             transforms = [
+                # *【主视觉分支尺寸确认】验证/推理同样使用 final_dim=[480,640]。
                 ImageAug3D(final_dim=final_dim, resize_lim=resize_lim, is_train=False),
                 NormalizeMultiviewImage(**img_norm_cfg),
+                # * 480 和 640 已经是 32 的整数倍，因此该 padding 不改变空间尺寸。
                 PadMultiViewImage(size_divisor=32)
             ]
         self.transforms = transforms
@@ -36,7 +40,10 @@ class Scannet_Scene_Occ_DatasetWrapper(data.Dataset):
         data = self.dataset[index]
         imgs, metas, occ = data
 
-        # deal with img augmentation
+        # 这里只处理第一条主视觉分支 imgs：训练时包括 ImageAug3D、颜色扰动、
+        # ImageNet 归一化和 padding。第二条 Depth Anything 输入已经保存在
+        # metas['img_depthbranch']，不会经过这里的 PhotoMetricDistortion；它使用
+        # dataset 中为 Depth Anything 单独定义的预处理，二者后续在 lifter 汇合。
         F, N, H, W, C = imgs.shape
         imgs_dict = {'img': imgs.reshape(F*N, H, W, C)}
         for t in self.transforms:

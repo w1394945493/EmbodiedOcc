@@ -245,9 +245,13 @@ def main(args):
             # forward + backward + optimize
             data_time_e = time.time()
 
+            # 【在线场景开始】为当前场景新建世界坐标 Gaussian memory；该状态随后在
+            # K_Frames 个连续视角之间持续更新，处理下一个场景时会重新初始化。
             model.scene_init(scenemeta) 
 
             for i in range(K_Frames):   # K_Frames:30
+                # 每次只向网络输入当前一帧；历史 RGB/视觉特征不会组成队列，
+                # 历史信息来自模型内部持续维护的世界坐标 Gaussian memory。
                 img = imgs[:, :, i, :, :, :].unsqueeze(2) # 1, 1, 1, 3, H, W    # (1 1 1 3 480 640)
                 label = labels[:, i, :, :, :].unsqueeze(1) # 1, 1, 60, 60, 36   # (1 1 60 60 36)
                 meta = [monometa_list_cuda[i]]
@@ -255,6 +259,8 @@ def main(args):
                 with torch.cuda.amp.autocast(enabled=amp):
                     result_dict, my_occ, predtoreturn, gaussianstensor_to_return, instance_feature_toreturn, gaussian_to_vis = my_model(scenemeta=scenemeta, imgs=img, metas=meta, points=None, label=label, grad_frames=cfg.grad_frames, test_mode=False)
 
+                # 将当前帧局部预测（已转到世界坐标）detach 后写回全局 memory，
+                # 下一帧会读取更新后的 Gaussian，但梯度不会跨越相邻帧。
                 model.scene_update(scenemeta, gaussianstensor_to_return, instance_feature_toreturn, meta[0]['mask_in_global_from_this'])
                 loss, loss_dict = loss_func(result_dict)
                 loss_record.update(loss=loss.item(), loss_dict=loss_dict)
@@ -277,6 +283,8 @@ def main(args):
                     model.globalhead.empty_opa = model.head.empty_opa
                     # endfix
 
+                    # 所有视角处理结束后，将累计观测过的世界 Gaussian 聚合到
+                    # 完整场景体素网格，得到场景级 global Occupancy。
                     scene_result_dict = model.get_global_occ(scenemeta, meta[0]['vox_origin'], meta[0]['scene_size'])
 
                     global_valid_mask = scene_result_dict['mask']
@@ -360,6 +368,9 @@ def main(args):
             CalMeanIou_Global.reset()
             loss_record = LossRecord(loss_func=loss_func)
             np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
+            # 【不是测试时在线学习】验证阶段整体位于 no_grad 中，且下方没有
+            # backward/optimizer.step；逐帧改变的只有 Gaussian memory 和可见区域 mask，
+            # 网络参数保持固定。因此这里属于 online mapping，而非 test-time training。
             with torch.no_grad():
                 for i_iter_val, data in enumerate(val_dataset_loader):
                     for i in range(len(data)):
@@ -380,6 +391,7 @@ def main(args):
                         monometa['img_depthbranch'] = monometa['img_depthbranch'].cuda()
                         monometa_list_cuda.append(monometa)
 
+                    # 每个验证场景都创建独立 memory，防止上一场景状态泄漏。
                     model.scene_init(scenemeta)
 
                     for i in range(K_Frames):
@@ -388,6 +400,7 @@ def main(args):
                         meta = [monometa_list_cuda[i]]
                         with torch.cuda.amp.autocast(enabled=amp):
                             result_dict, my_occ, predtoreturn, gaussianstensor_to_return, instance_feature_toreturn, gaussian_to_vis = my_model(scenemeta=scenemeta, imgs=img, metas=meta, points=None, label=label, grad_frames=None, test_mode=True)
+                        # 仅在线更新场景状态；由于外层 no_grad，绝不会更新模型权重。
                         model.scene_update(scenemeta, gaussianstensor_to_return, instance_feature_toreturn, meta[0]['mask_in_global_from_this'])
 
                         loss, loss_dict = loss_func(result_dict)

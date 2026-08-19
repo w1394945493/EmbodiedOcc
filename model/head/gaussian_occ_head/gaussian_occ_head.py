@@ -58,6 +58,7 @@ class GaussianOccHead(BaseModule):
         self.semantics_activation = semantics_activation
 
     def anchor2gaussian(self, anchor, metas):
+        """把最后一层 anchor 解码为当前相机坐标系的显式 Gaussian。"""
 
         # vox_near = metas[0]['vox_origin']
         # scene_size = metas[0]['scene_size']
@@ -68,6 +69,9 @@ class GaussianOccHead(BaseModule):
         # cam_vox_range = metas[0]['cam_vox_range'].to(anchor.device)
         # xyz = cartesian(anchor, cam_vox_range)
         # 支持 bs>1：每个样本使用自己的 [xmin, ymin, zmin, xmax, ymax, zmax]。
+        # *【单帧流程 5：anchor -> 显式 Gaussian】
+        # * xyz logits 映射回相机局部范围；其余通道解码为 scale、rotation、
+        # * opacity 和 12 个非空语义 logits。empty 类稍后由专用 Gaussian 建模。
         cam_vox_range = torch.stack([m['cam_vox_range'] for m in metas]).to(anchor.device, anchor.dtype)
         xyz_01 = safe_sigmoid(anchor[..., :3])
         xyz = xyz_01 * (
@@ -110,6 +114,9 @@ class GaussianOccHead(BaseModule):
         # means_world_ = (cam2world @ means_cam.unsqueeze(-1)).squeeze(-1)
         # means_world = means_world_[:, :3].reshape(b_, g_, 3)
         # 支持 bs>1：保留 [B, G]，为每个样本应用自己的 cam2world。
+        # *【单帧流程 6：相机 Gaussian -> 世界 Gaussian】
+        # * occ_xyz 是世界坐标查询点，因此中心需经 cam2world 变换，椭球协方差
+        # * 也用其旋转部分变换；scale、opacity 和 semantic 数值本身不变。
         means_cam = F.pad(means.to(torch.float32), (0, 1), value=1.0)
         cam2world = torch.stack([m['cam2world'] for m in metas]).to(means.device, torch.float32)
         means_world = torch.matmul(cam2world[:, None], means_cam[..., None]).squeeze(-1)[..., :3]
@@ -126,6 +133,8 @@ class GaussianOccHead(BaseModule):
         if origi_opa.numel() == 0:
             origi_opa = torch.ones_like(opacities[..., :1], requires_grad=False)
         if self.with_emtpy:
+            # 用一个覆盖局部场景的超大 Gaussian 提供 empty=12 类基准响应；
+            # 中心取体素区域中心，尺度来自配置中的 [1e5,1e5,1e5]。
             assert opacities.shape[-1] == self.num_classes - 1
             # 仅支持 bs=1 的原实现：只生成一个样本的 empty Gaussian，buffer 也保持 batch=1。
             # vox_origin = metas[0]['vox_origin']
@@ -197,6 +206,8 @@ class GaussianOccHead(BaseModule):
         # sampled_label: b, n
         # 仅支持 bs=1 的原限制；新实现保留 batch 维，因此不再执行。
         # assert bev_feat.shape[0] == 1
+        # *【单帧流程 7：世界 Gaussian -> 当前局部规则体素 Occ】
+        # * 输入只有当前帧最终 anchors；输出是局部区域而非累计的整场景地图。
         anchors = bev_feat # [1, 1, 21600, 24]
         # 当前单目训练配置 num_frames=1；batch 与 frame 不混合，避免 metadata 对应关系丢失。
         B, Fm, G, _ = anchors.shape
@@ -233,6 +244,8 @@ class GaussianOccHead(BaseModule):
                 (means[i, :, 2] > nyu_pc_min[2] + epsilon) &
                 (means[i, :, 2] < nyu_pc_max[2] - epsilon))
             origin_use = nyu_pc_min.to(torch.float32)
+            # 对 60x60x36 个世界坐标体素中心聚合有效 Gaussian 的椭球空间权重、
+            # opacity 和 semantic contribution，得到每体素 13 类响应。
             semantic = self.aggregator(
                 sampled_xyz[i:(i+1)], 
                 means[i:i+1, mask],
@@ -247,6 +260,8 @@ class GaussianOccHead(BaseModule):
         semantics = torch.stack(semantics, dim=0).transpose(1, 2) # [1, 13, 129600]
         spatial_shape = label.shape[2:] # [60, 60, 36]
 
+        # ce_input 是 train_mono 中所有 Occupancy loss 与验证 argmax 的直接输入；
+        # fov_mask 将监督限定到当前相机的有效视锥区域。
         result_dict = {
             'ce_input': semantics.unflatten(-1, spatial_shape), # [1, 13, 60, 60, 36]
             # 仅支持 bs=1 的原实现：label.squeeze(0) 和 metas[0] 会丢失/忽略 batch。

@@ -270,6 +270,11 @@ def main(args):
                 if isinstance(data[i], torch.Tensor):
                     data[i] = data[i].cuda()
             (imgs, metas, label) = data
+            # 同一帧 RGB 在 Dataset 中被准备成两套输入：
+            #   imgs：第一条主视觉分支，进入 EfficientNet-B7 + DecoderBN；
+            #   metas[*]['img_depthbranch']：第二条深度分支，进入 Depth Anything。
+            # 二者不会在 train_mono.py 中直接拼接，而是在模型 lifter 中通过
+            # “深度增强 Gaussian query”与“多尺度图像 feature”联合起来。
 
             # 仅支持 bs=1 的原实现：只搬运 metas[0] 到 GPU。
             # for k, v in metas[0].items():
@@ -287,12 +292,18 @@ def main(args):
                             meta[k] = torch.as_tensor(v, device=device)
                 meta["img_depthbranch"] = meta["img_depthbranch"].to(device)
 
+            # *【单帧流程 1：训练入口】
+            # * F=1，没有历史 Gaussian、历史特征或跨帧梯度；每个样本独立完成
+            # * RGB/深度先验提取、Gaussian 细化和局部 Occupancy 预测。
             # forward + backward + optimize
             data_time_e = time.time()
 
             with torch.cuda.amp.autocast(enabled=amp):
                 result_dict, my_occ, predtoreturn = my_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=cfg.grad_frames, test_mode=False)
 
+            # *【单帧流程 8：Occupancy 监督】
+            # * ce_input 是 [B,13,60,60,36] 体素 logits。Focal、Lovasz、语义尺度
+            # * 和几何尺度损失都监督最终 Occ；冻结 Depth Anything 没有 depth loss。
             loss, loss_dict = loss_func(result_dict)
             loss_record.update(loss=loss.item(), loss_dict=loss_dict)
 
@@ -400,6 +411,8 @@ def main(args):
 
                         meta["img_depthbranch"] = meta["img_depthbranch"].to(device)
 
+                    # *【单帧验证】复用训练时相同的 forward，只切换 eval/no_grad；
+                    # * test_mode 不会引入历史状态或全局 Gaussian 地图。
                     with torch.cuda.amp.autocast(enabled=amp):
                         result_dict, my_occ, predtoreturn = eval_model(imgs=imgs, metas=metas, points=None, label=label, grad_frames=None, test_mode=True)
 

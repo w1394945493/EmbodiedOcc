@@ -26,6 +26,9 @@ cls_dims = 13
 
 pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] 
 scale_range = [0.01, 0.08] 
+# *【主视觉分支目标尺寸】顺序为 [H,W]。它控制 DatasetWrapper 中的
+# * ImageAug3D；Depth Anything 分支另有 keep-aspect-ratio/14倍数 Resize，
+# * 所以其网络输入是 490x644，但输出深度会再恢复到这里的 480x640。
 image_size = [480, 640]
 resize_lim = [1.0, 1.0] 
 num_frames = 1
@@ -72,6 +75,9 @@ spconv_layer=dict(
 )
 
 model = dict(
+    # *【单帧流程配置】GaussianSegmentor 不维护历史状态，且 num_frames=1。
+    # * 双 RGB 分支分别提供多尺度外观和冻结深度先验；Lifter 注入深度，三层
+    # * SparseGaussianFormer 细化，最后由 GaussianOccHead 栅格化。
     type='GaussianSegmentor',
     flag_depthbranch=True,
     flag_depthanything_as_gt=flag_depthanything_as_gt,
@@ -156,6 +162,8 @@ model = dict(
 
 
 loss = dict(
+    # *【单帧流程 8：训练目标】仅包含 Occupancy 损失，没有 DepthLoss；
+    # * Depth Anything 是冻结的外部几何先验，其输出不接受反向监督。
     type='MultiLoss',
     loss_cfgs=[
         dict(

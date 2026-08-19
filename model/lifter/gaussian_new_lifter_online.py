@@ -164,12 +164,15 @@ class GaussianNewLifterOnline(nn.Module):
         instance_feature_pool_old = instance_feature_pool
         
         if gaussian_pool.shape[1] > 0:
-            # get anchor from the pool
+            # 【从全局池读取历史 Gaussian】池中的 xyz/rotation 使用世界坐标；
+            # 当前帧只临时将相关 Gaussian 变换到当前相机坐标系进行图像特征交互，
+            # 全局持久化表示本身始终固定在世界坐标系下。
             gaussian_pool_old = gaussian_pool_old.squeeze(0)
             if self.reuse_instance_feature:
                 instance_feature_pool_old = instance_feature_pool_old.squeeze(0)
             gaussian_pool_xyz = gaussian_pool_old[:, :3] # world coord
             
+            # 用当前帧相机位姿完成 world -> current camera 对齐。
             world2cam = metas[0]['world2cam'].to(torch.float32)
             gaussian_pool_xyz_ = torch.cat([gaussian_pool_xyz, torch.ones((gaussian_pool_xyz.shape[0], 1), device=gaussian_pool_xyz.device)], dim=1).to(torch.float32)
             gaussian_pool_cam_ = (world2cam @ gaussian_pool_xyz_.unsqueeze(-1)).squeeze(-1)
@@ -187,6 +190,8 @@ class GaussianNewLifterOnline(nn.Module):
             mask2 = (gaussian_pool_pix_x >= 0) & (gaussian_pool_pix_x < 640) & (gaussian_pool_pix_y >= 0) & (gaussian_pool_pix_y < 480)
             mask_all = mask1 & mask2
             
+            # 当前帧只处理其局部 Occupancy 体积内的历史 Gaussian，而不是每帧都
+            # 对完整全局池执行 Decoder；这是在线全局建图仍能局部计算的关键。
             vox_near_world = metas[0]['vox_origin']
             vox_far_world = metas[0]['vox_origin'] + metas[0]['scene_size']
             epsilon = 1e-3
@@ -209,6 +214,8 @@ class GaussianNewLifterOnline(nn.Module):
             # gaussian_reused = gaussian_pool_old[gaussian_pool_mask_detach]
             # gaussian_reused = gaussian_pool_old[gaussian_pool_mask]
             # gaussian_unchange = gaussian_pool_old[~gaussian_pool_mask]
+            # 当前局部体积且落入图像视野的旧 Gaussian 将由本帧重新预测，先从池中删除；
+            # 当前不可见的历史 Gaussian 则保持不变。细化结果稍后由 scene_update 写回。
             gaussian_unchange = gaussian_pool_old[~gaussian_pool_mask_detach]
             gaussian_pool_new = gaussian_unchange.unsqueeze(0)
             if self.reuse_instance_feature:
@@ -221,7 +228,9 @@ class GaussianNewLifterOnline(nn.Module):
             
             # gaussian_reused_tag = gaussian_reused[..., 23]
             gaussian_reused_tag = tag
-            # worldgaussian to camanchor
+            # 将待细化的世界坐标 Gaussian 转成当前相机坐标 anchor。
+            # Decoder 因而可以沿用单帧 GaussianFormer 的局部相机坐标参数化；
+            # head 输出后还会再通过 cam2world 转回世界坐标并写回全局 memory。
             gaussian_reused = gaussian_reused[..., :-2]
             gaussian_means_world = gaussian_reused[:, :3]
             gaussian_scales = gaussian_reused[:, 3:6]

@@ -77,7 +77,7 @@ def sample_3d_feature(feature_3d, pix_xy, pix_z, fov_mask):
         feature_3d (torch.tensor): 3D feature, shape (C, D, H, W).
         pix_xy (torch.tensor): Projected pix coordinate, shape (N, 2).
         pix_z (torch.tensor): Projected pix depth coordinate, shape (N,).
-    
+
     Returns:
         torch.tensor: Sampled feature, shape (N, C)
     """
@@ -89,15 +89,15 @@ def sample_3d_feature(feature_3d, pix_xy, pix_z, fov_mask):
 class DepthAwareLayer(nn.Module):
     def __init__(self, embed_dim):
         super(DepthAwareLayer, self).__init__()
-        self.fc1 = nn.Linear(2, 64)   
-        self.fc2 = nn.Linear(64, 128) 
-        self.fc3 = nn.Linear(128, embed_dim) 
-        self.relu = nn.ReLU()       
+        self.fc1 = nn.Linear(2, 64)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc3 = nn.Linear(128, embed_dim)
+        self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.relu(self.fc1(x)) 
-        x = self.relu(self.fc2(x))  
-        x = self.fc3(x)            
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
 
 
@@ -108,7 +108,7 @@ class GaussianNewLifter(nn.Module):
         embed_dims, # 96
         num_anchor=25600, # 21600
         anchor=None,
-        anchor_grad=False, 
+        anchor_grad=False,
         feat_grad=False,
         semantic_dim=0, # 13
         include_opa=True,
@@ -125,7 +125,7 @@ class GaussianNewLifter(nn.Module):
             xyz = torch.rand(num_anchor, 3, dtype=torch.float)
             assert xyz.shape[0] == num_anchor
             xyz = safe_inverse_sigmoid(xyz)
-    
+
             scale = torch.rand_like(xyz)
             scale = safe_inverse_sigmoid(scale)
             rots = torch.zeros(num_anchor, 4, dtype=torch.float)
@@ -134,7 +134,7 @@ class GaussianNewLifter(nn.Module):
                 num_anchor, int(include_opa)), dtype=torch.float))
             semantic = torch.randn(num_anchor, semantic_dim, dtype=torch.float)
             self.semantic_dim = semantic_dim
-            
+
             anchor = torch.cat([xyz, scale, rots, opacity, semantic], dim=-1)
 
         self.num_anchor = total_anchor
@@ -143,18 +143,20 @@ class GaussianNewLifter(nn.Module):
             requires_grad=anchor_grad,
         )
         self.anchor_init = anchor
-        
+
         self.instance_feature_layer = nn.Linear(
             3 + 3 + 4 + int(include_opa) + semantic_dim, embed_dims)
-        
+
         self.depth_aware_layer = DepthAwareLayer(embed_dims)
-        
+
 
     def init_weight(self):
         self.anchor.data = self.anchor.data.new_tensor(self.anchor_init)
-    
+
     def forward(self, flag_depthbranch, flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas):
-        
+        # *【单帧流程 3.1：复制固定 Gaussian 模板】
+        # * self.anchor 是全数据集共享的随机模板，默认 anchor_grad=False；每个样本
+        # * 复制同一模板，再利用自己的场景范围和相机位姿重新定位。
         batch_size = mlvl_img_feats[0].shape[0]
         anchor = torch.tile(self.anchor[None], (batch_size, 1, 1)) # 1, 16200, 23
         # 仅支持 bs=1 的原实现：所有坐标、内参、深度和旋转都固定读取 metas[0]，
@@ -191,16 +193,25 @@ class GaussianNewLifter(nn.Module):
         cam_k = torch.stack([meta['cam_k'] for meta in metas], dim=0).to(device=device, dtype=dtype)
         cam_vox_range = torch.stack([meta['cam_vox_range'] for meta in metas], dim=0).to(device=device, dtype=dtype)
 
+        # *【单帧流程 3.2：世界候选 -> 当前相机候选】
+        # * anchor 前三维先映射到当前 ScanNet 场景包围盒，再由 world2cam 转入
+        # * 当前相机系，以便投影到当前 RGB 和深度图。
         anchor_xyz_01 = safe_sigmoid(anchor[..., :3])
         anchor_xyz_world = anchor_xyz_01 * scene_size[:, None, :] + world_near[:, None, :]
         anchor_xyz_world_h = F.pad(anchor_xyz_world.to(torch.float32), (0, 1), value=1.0)
         anchor_xyz_cam_h = torch.matmul(world2cam[:, None], anchor_xyz_world_h[..., None]).squeeze(-1)
         anchor_xyz_cam = anchor_xyz_cam_h[..., :3].to(dtype)
 
+        # *【单帧流程 3.3：把候选 Gaussian 投影到图像】
+        # * 用相机内参得到每个中心的 (u,v)。clamp_min 防止除零，随后像素坐标
+        # * 还会被截到深度图边界，因此越界候选会查询边界像素深度。
         depth_safe = anchor_xyz_cam[..., 2].clamp_min(1e-6)
         anchor_pix_x = cam_k[:, None, 0, 0] * anchor_xyz_cam[..., 0] / depth_safe + cam_k[:, None, 0, 2]
         anchor_pix_y = cam_k[:, None, 1, 1] * anchor_xyz_cam[..., 1] / depth_safe + cam_k[:, None, 1, 2]
 
+        # 第二条 RGB 分支的输出在这里真正参与 Gaussian 推理：配置
+        # flag_depthanything_as_gt=True 时 z 是 Depth Anything 的预测深度；若为
+        # False，当前实现改用 ScanNet meta['depth_gt']，并不存在另一套可学习 DepthNet。
         if flag_depthbranch:
             if flag_depthanything_as_gt:
                 z = depthnet_output
@@ -217,11 +228,21 @@ class GaussianNewLifter(nn.Module):
         anchor_pix_x = anchor_pix_x.clamp(0, depth_w - 1).long()
         anchor_pix_y = anchor_pix_y.clamp(0, depth_h - 1).long()
         batch_index = torch.arange(batch_size, device=device)[:, None]
+        # *【单帧流程 3.4：为每个候选查询并编码深度先验】
+        # 对每个初始 Gaussian：取两个深度，分别是gaussian投影像素处，depth anything预测的表面深度，以及该 Gaussian 候选自身在相机坐标系中的 z 深度。
+        #   anchor_depth_from_z = 它投影到的像素处，Depth Anything 预测的表面深度；
+        #   anchor_depth_real   = 该 Gaussian 候选自身在相机坐标系中的 z 深度。
+        # 二者共同描述候选位于可见表面之前、附近还是之后。
         anchor_depth_from_z = z[batch_index, anchor_pix_y, anchor_pix_x]
         anchor_depth_real = anchor_xyz_cam[..., 2]
+        # DepthAwareLayer 将两个标量编码成与 query 相同的 96 维特征。深度并没有
+        # 在这里直接覆盖 anchor xyz，而是作为软几何条件交给后续 encoder 学习利用。
         anchor_depth_feature = self.depth_aware_layer(
             torch.stack((anchor_depth_from_z, anchor_depth_real), dim=-1))
 
+        # *【单帧流程 3.5：建立相机局部 anchor 表示】
+        # * 将中心限制到 cam_vox_range，归一化后转回 logits；后续 Encoder 和
+        # * Occ head 均按这套相机局部范围解释 anchor xyz。
         range_min = cam_vox_range[:, None, :3]
         range_max = cam_vox_range[:, None, 3:]
         points_cam = torch.maximum(torch.minimum(anchor_xyz_cam, range_max), range_min)
@@ -239,19 +260,27 @@ class GaussianNewLifter(nn.Module):
             batch_quaternion_multiply(w2c_quats[b], anchor_rots[b])
             for b in range(batch_size)
         ], dim=0)
+        # 初始椭球旋转也从世界系变到相机系，确保中心和朝向使用同一坐标约定。
         anchor_points_[..., 3:7] = anchor_rots_cam
-        
+
         anchor_points = torch.cat([
             safe_inverse_sigmoid(torch.clamp(anchor_points, 0.001, 0.999)),
             anchor_points_
         ], dim=-1)
-        
+
         anchor = anchor_points
-        
+
+        # ------------------------- 两条 RGB 信息的连接点 ------------------
+        # instance_feature_layer 先从 Gaussian 显式属性生成基础 query；随后叠加
+        # Depth Anything 提供的深度特征。返回后，GaussianSegmentor.obtain_bev()
+        # 会让该深度增强 query 从第一条 RGB 分支的 mlvl_img_feats 中采样特征。
         instance_feature = self.instance_feature_layer(anchor)
         # 仅支持 bs=1 的原实现：anchor_depth_feature 没有 batch 维。
         # instance_feature = instance_feature + anchor_depth_feature.unsqueeze(0)
         # 支持 bs>1：深度特征已经是 [B, G, C]，可与实例特征逐样本相加。
-        instance_feature = instance_feature + anchor_depth_feature
-        
+        # *【单帧流程 3.6：形成 depth-aware Gaussian query】
+        # * 深度只加到隐式 query feature，不会直接覆盖显式 anchor xyz；后续网络
+        # * 根据表面深度与候选深度关系学习移动、保留或抑制 Gaussian。
+        instance_feature = instance_feature + anchor_depth_feature  # query特征包含：gaussian自身属性编码 + 射线深度几何信息
+
         return anchor, instance_feature, None, None, None

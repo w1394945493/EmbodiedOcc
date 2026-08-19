@@ -130,7 +130,9 @@ class GaussianOccHeadLocal(BaseModule):
     def prepare_gaussian_args(self, gaussians, metas, anchor_new_tag, instance_feature_cache):
 
         means = gaussians.means # b, g, 3
-        # myfix
+        # 【局部预测转回全局记忆】Encoder 输出的 Gaussian 中心位于当前相机坐标系；
+        # 写入持久化场景池之前必须使用本帧 cam2world 转换到统一世界坐标系。
+        # 这样后续任意相机位姿都能通过 world2cam 再次读取同一个空间位置。
         b_, g_, _ = means.shape
         means = means.reshape(-1, 3)
         means_cam = torch.cat((means, torch.ones((means.shape[0], 1), device=means.device)), dim=1).to(torch.float32)
@@ -161,6 +163,7 @@ class GaussianOccHeadLocal(BaseModule):
         rotations_cam = rotations.squeeze(0) # N, 4
         c2w_rot = metas[0]['cam2world'][:3, :3].to(torch.float32)
         c2w_quat = safe_get_quaternion(c2w_rot.unsqueeze(0)).squeeze(0)
+        # 不仅中心要转到世界系，Gaussian 椭球朝向也必须同步旋转到世界系。
         rotations_world = batch_quaternion_multiply(c2w_quat, rotations_cam).unsqueeze(0) # 1, N, 4
         rotations_to_return = rotations_world[mask_toreturn] # N', 4
 
@@ -201,6 +204,7 @@ class GaussianOccHeadLocal(BaseModule):
         anchor_new_tag = anchor_new_tag[means_pix_mask]
         instance_feature_cache = instance_feature_cache[means_pix_mask]
 
+        # 返回给 scene_update() 的显式 Gaussian 已统一为世界坐标表示。
         gaussianstensor_to_return = torch.cat([means_to_return_true, scales_to_return, rotations_to_return, origi_opa_to_return, opacities_to_return], dim=-1).unsqueeze(0) # 1, N', 23
         gaussiantensor_to_return_tag = torch.ones_like(gaussianstensor_to_return[..., :1], dtype=torch.float32)
         gaussian_return_splat_tag = torch.ones_like(gaussianstensor_to_return[..., :1], dtype=torch.float32)

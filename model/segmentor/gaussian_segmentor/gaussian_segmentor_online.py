@@ -181,10 +181,16 @@ class GaussianSegmentorOnline(BaseModule):
         else:
             depthnet_output = None
         
-        gaussian_pool = self.gaussian_tensor # 1, N, 23
+        # 【在线全局记忆：读】self.gaussian_tensor 是当前场景持续维护的 Gaussian 池。
+        # 其中 Gaussian 的中心、旋转均以统一的世界坐标系保存，因此相机移动后不需要
+        # 搬动整张地图；当前帧只需在 lifter 中依据 world2cam 取出并对齐附近 Gaussian。
+        gaussian_pool = self.gaussian_tensor # 1, N, 25（含 predicted/splat 两个状态标记）
         global_mask_thistime = self.global_mask_thistime
         instance_feature_pool = self.gaussian_instance_feature
         anchor, instance_feature, depth2occ, depthnet_output_loss, predtoreturn, gaussian_pool_new, anchor_new_tag, instance_feature_pool_new = self.lifter(scenemeta, gaussian_pool, instance_feature_pool, global_mask_thistime, self.flag_depthbranch, self.flag_depthanything_as_gt, depthnet_output, mlvl_img_feats, metas)    # b, g, c 
+        # lifter 已从池中暂时移除“当前可见、即将被重新预测”的旧 Gaussian；
+        # 不在当前视野内的历史 Gaussian 原样留在 gaussian_pool_new 中。
+        # 当前帧细化后的版本会在 forward 返回后由 scene_update() 写回。
         self.gaussian_tensor = gaussian_pool_new
         self.gaussian_instance_feature = instance_feature_pool_new
         
@@ -193,7 +199,8 @@ class GaussianSegmentorOnline(BaseModule):
         return anchor, depth2occ, depthnet_output_loss, predtoreturn, anchor_new_tag, instance_feature_cache
     
     def scene_init(self, scenemeta):
-        
+        # 【在线全局记忆：按场景初始化】每进入一个新 ScanNet 场景都重新调用本函数，
+        # 因而 Gaussian memory 只在同一场景的视频帧之间持续，不会跨场景传播。
         self.scene_name = scenemeta['scene_name']
         self.global_scene_dim = scenemeta['global_scene_dim']
         self.global_scene_size = scenemeta['global_scene_size']
@@ -207,6 +214,9 @@ class GaussianSegmentorOnline(BaseModule):
         local_meter = 0.16
         self.gaussian_random_num = int(scenemeta['global_scene_size'][0]/local_meter) * int(scenemeta['global_scene_size'][1]/local_meter) * int(scenemeta['global_scene_size'][2]/local_meter)
         
+        # 在“完整场景的世界坐标包围盒”内预置随机 Gaussian 种子。
+        # 后续相机运动到某一区域时，lifter 才取出该区域的种子并结合当前观测细化；
+        # 尚未被观察的种子仍保留在池中，但不会参与最终全局 Occ 聚合。
         xyz = torch.rand((self.gaussian_random_num, 3), dtype=torch.float32).to(device)
         xyz_world = xyz * self.global_scene_size + self.global_scene_origin
         xyz_world = xyz_world.to(dtype=torch.float32)
@@ -224,29 +234,40 @@ class GaussianSegmentorOnline(BaseModule):
         self.gaussian_instance_feature = torch.randn((1, self.gaussian_random_num, 96), dtype=torch.float).to(device)
     
     def scene_update(self, scenemeta, gaussianfromhead, instance_feature_fromhead, global_mask_from_thisframe):
-        
+        # 【在线全局记忆：写】当前帧 head 输出的是已经由 cam2world 转回世界坐标的
+        # Gaussian。这里将其写回场景级池，供后续帧继续读取和细化。
+        # detach 明确切断跨帧计算图：数值状态会跨帧保存，但第 t+1 帧损失不能沿着
+        # memory 反向优化第 t 帧生成 Gaussian 的过程。
         gaussianfromhead = gaussianfromhead.detach()
         instance_feature_fromhead = instance_feature_fromhead.detach()
         gaussianfromhead_xyz = gaussianfromhead[..., :3]
         scene_near = self.global_scene_origin
         scene_far = scene_near + self.global_scene_size
         
+        # 只允许完整场景包围盒内的预测进入全局池，避免异常 Gaussian 污染地图。
         mask = (gaussianfromhead_xyz[..., 0] >= scene_near[0]) & (gaussianfromhead_xyz[..., 0] <= scene_far[0]) & (gaussianfromhead_xyz[..., 1] >= scene_near[1]) & (gaussianfromhead_xyz[..., 1] <= scene_far[1]) & (gaussianfromhead_xyz[..., 2] >= scene_near[2]) & (gaussianfromhead_xyz[..., 2] <= scene_far[2])
         
         gaussianfromhead_add = gaussianfromhead[mask].unsqueeze(0)
         instance_feature_fromhead_add = instance_feature_fromhead[mask].unsqueeze(0)
         
+        # 当前视野内的旧版本已在 lifter 中移除，所以这里的 cat 整体上相当于
+        # “保留不可见历史区域 + 写回当前区域的新版本”，而不是无条件累积所有旧版本。
         self.gaussian_tensor = torch.cat([self.gaussian_tensor, gaussianfromhead_add], dim=1)
         self.gaussian_instance_feature = torch.cat([self.gaussian_instance_feature, instance_feature_fromhead_add], dim=1)
         global_mask_from_thisframe = global_mask_from_thisframe.to(dtype=torch.bool)
+        # 累积截至当前帧曾经被观察过的全局体素区域，供最终全局评估/聚合使用。
         self.global_mask_thistime = self.global_mask_thistime | global_mask_from_thisframe
         
     
     def get_global_occ(self, scenemeta, vox_origin, scene_size):
+        # 【全局 Occ 聚合】该函数不再读取当前 RGB，而是把截至当前帧累计得到的
+        # 世界坐标 Gaussian 一次性 splat/聚合到完整场景级体素网格中。
         scene_result_dict = dict()
         bev = self.gaussian_tensor # [1, N, 24]
         bev_tag = bev[..., -1]
         bev = bev[..., :-2]
+        # splat_flag==1 表示该 Gaussian 所在区域至少被某一帧实际处理过；
+        # 排除 scene_init 中尚未观察、仍为随机值的全局 Gaussian 种子。
         bev_valid = bev[bev_tag == 1]
         
         scene_result_dict = self.globalhead(
