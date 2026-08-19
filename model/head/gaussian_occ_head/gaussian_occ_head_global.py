@@ -32,10 +32,8 @@ class GaussianOccHeadGlobal(BaseModule):
         self.classes = list(range(num_classes))
 
         self.cuda_kwargs = cuda_kwargs
-        sys.path.append(
-            "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/model/head/gaussian_occ_head/ops/localagg"
-        )
-        from local_aggregate import LocalAggregator
+        # from local_aggregate import LocalAggregator
+        from model.head.gaussian_occ_head.ops.localagg.local_aggregate import LocalAggregator
         self.aggregator = LocalAggregator(**cuda_kwargs)
 
         if with_empty:

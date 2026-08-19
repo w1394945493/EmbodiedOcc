@@ -5,12 +5,12 @@ from mmengine.model import BaseModule
 from mmengine.registry import MODELS
 from mmseg.registry import MODELS as MODELS_SEG
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/EfficientNet-PyTorch')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/EfficientNet-PyTorch')
 from efficientnet_pytorch import EfficientNet
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/model/depthbranch')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/model/depthbranch')
 from depth_anything_v2.dpt import DepthAnythingV2
 from depthnet import DepthNet
 from unet2d import DecoderBN
@@ -58,7 +58,9 @@ class GaussianSegmentorOnline(BaseModule):
                     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
                 }
                 self.depthanything = DepthAnythingV2(**{**model_configs['vitb'], 'max_depth':20})
-                checkpoint = torch.load('/data1/code/wyq/gaussianindoor/EmbodiedOcc/checkpoints/finetune_scannet_depthanythingv2.pth', map_location='cpu')['model']
+                # checkpoint = torch.load('/data1/code/wyq/gaussianindoor/EmbodiedOcc/checkpoints/finetune_scannet_depthanythingv2.pth', map_location='cpu')['model']
+                checkpoint = torch.load('/c20250502/wangyushen/Weights/gpocc/finetune_scannet_depthanythingv2.pth', map_location='cpu')['model']
+                
                 new_state_dict = {}
                 for k, v in checkpoint.items():
                     if k.startswith('module.'):
@@ -95,8 +97,11 @@ class GaussianSegmentorOnline(BaseModule):
             basemodel_name = "tf_efficientnet_b7_ns"
             num_features = 2560
             print("Loading base model ()...".format(basemodel_name), end="")
+            # basemodel = torch.hub.load(
+            #     "/home/wyq/.cache/torch/hub/rwightman_gen-efficientnet-pytorch_master", basemodel_name, pretrained=True, trust_repo=True, source='local'
+            # )
             basemodel = torch.hub.load(
-                "/home/wyq/.cache/torch/hub/rwightman_gen-efficientnet-pytorch_master", basemodel_name, pretrained=True, trust_repo=True, source='local'
+                "rwightman/gen-efficientnet-pytorch", basemodel_name, pretrained=True
             )
             print("Done.")
             # Remove last layer

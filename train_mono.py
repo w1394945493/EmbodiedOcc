@@ -180,6 +180,7 @@ def main(args):
             dist=distributed,
         )
 
+    # =======================================#
     if distributed:
         # 仅支持训练用途的原实现：DistributedSampler(drop_last=False) 会在验证集
         # 长度不能整除进程数时补入重复样本，导致最终指标有偏差。
@@ -203,11 +204,12 @@ def main(args):
     loss_func = GPD_LOSS.build(cfg.loss).cuda()
     scheduler = CosineLRScheduler(
         optimizer,
-        t_initial=len(train_dataset_loader)*max_num_epochs,
+        t_initial=len(train_dataset_loader) * max_num_epochs,
         lr_min=1e-6,
         warmup_t=1000, # FIXME
+        # warmup_t=0,  # FIXME
         warmup_lr_init=1e-6,
-        t_in_epochs=False
+        t_in_epochs=False,
     )
 
     CalMeanIou = SSCMetrics(n_classes=12)
@@ -318,7 +320,7 @@ def main(args):
             if i_iter % print_freq == 0 and is_main_process():
                 lr = optimizer.param_groups[0]['lr']
                 loss_info = loss_record.loss_info()
-                
+
                 # logger.info('[TRAIN] Epoch %d Iter %5d/%d   ' % (epoch+1, i_iter, len(train_dataset_loader)) + loss_info +
                 #             'GradNorm: %.3f,   lr: %.7f,   time: %.3f (%.3f)' % (grad_norm, lr, time_e - time_s, data_time_e - data_time_s))
                 logger.info(

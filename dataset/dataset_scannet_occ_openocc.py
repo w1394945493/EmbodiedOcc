@@ -54,7 +54,9 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
             self.used_subscenes = f.readlines()
             for i in range(len(self.used_subscenes)):
                 self.used_subscenes[i] = f'{self.occscannet_root}/' + self.used_subscenes[i].strip()
-
+        #!!!
+        # self.used_subscenes = self.used_subscenes[:20]
+        
         self.num_pts = num_pts
 
         self.normalize_rgb = transforms.Compose(

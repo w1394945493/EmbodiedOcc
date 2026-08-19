@@ -22,8 +22,8 @@ import open3d as o3d
 import warnings
 warnings.filterwarnings("ignore")
 import sys
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
-sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc')
+# sys.path.append('/data1/code/wyq/gaussianindoor/EmbodiedOcc/Depth-Anything-V2/metric_depth')
 from PIL import Image
 
 def pass_print(*args, **kwargs):
@@ -49,19 +49,45 @@ def main(args):
     eval_freq = cfg.eval_freq
     print_freq = cfg.print_freq
 
-    # init DDP
-    distributed = True
-    world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
-    rank = int(os.environ["RANK"])  # node id
-    gpu = int(os.environ['LOCAL_RANK'])
-    
-    dist.init_process_group(
-        backend="nccl", init_method=f"env://", 
-        world_size=world_size, rank=rank
-    )
+    # # init DDP
+    # distributed = True
+    # world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
+    # rank = int(os.environ["RANK"])  # node id
+    # gpu = int(os.environ['LOCAL_RANK'])
 
-    # dist.barrier()
-    torch.cuda.set_device(gpu)
+    # dist.init_process_group(
+    #     backend="nccl", init_method=f"env://",
+    #     world_size=world_size, rank=rank
+    # )
+
+    # # dist.barrier()
+    # torch.cuda.set_device(gpu)
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if distributed:
+        # init DDP
+        # distributed = True
+        world_size = int(os.environ["WORLD_SIZE"])  # number of nodes
+        rank = int(os.environ["RANK"])  # node id
+
+        num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            raise RuntimeError("分布式训练需要至少一张可用的 CUDA GPU")
+        # 仅支持特定启动方式的原实现：后续 DDP 使用了未定义的 gpu。
+        # gpu = rank % num_gpus
+        # 支持 torchrun 单机/多机：LOCAL_RANK 才是当前节点上的 CUDA 设备编号。
+        gpu = int(os.environ.get("LOCAL_RANK", rank % num_gpus))
+        torch.cuda.set_device(gpu)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+        )
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+        # torch.cuda.set_device(0)
 
     if not is_main_process():
         import builtins
@@ -77,11 +103,10 @@ def main(args):
     logger = MMLogger(name='indoor_nyu', log_file=log_file, log_level='INFO')
     logger.info(f'Config:\n{cfg.pretty_text}')
 
-
     # build model
     from model import build_model
     my_model = build_model(cfg.model)
-    
+
     if cfg.flag_depthanything_as_gt:
         my_model.depthanything.requires_grad_(False)
     my_model.globalhead.requires_grad_(False)
@@ -100,6 +125,11 @@ def main(args):
             find_unused_parameters=find_unused_parameters)
     else:
         my_model = my_model.cuda()
+
+    # 后续需要调用 scene_init/update_global_mask 等 Online 专用方法；DDP 包装后
+    # 这些方法位于 my_model.module，因此保留一份解包后的 model 引用。
+    model = my_model.module if distributed else my_model
+
     print('done ddp model')
     # build dataloader
     from dataset import build_dataloader
@@ -143,7 +173,7 @@ def main(args):
         cfg.resume_from = osp.join(args.work_dir, 'latest.pth')
     if args.resume_from:
         cfg.resume_from = args.resume_from
-    
+
     print('resume from: ', cfg.resume_from)
     print('work dir: ', args.work_dir)
 
@@ -175,13 +205,13 @@ def main(args):
         except:
             state_dict = revise_ckpt_2(state_dict)
             print(my_model.load_state_dict(state_dict, strict=False))
-            
-    
+
     scenemeta_keys = ['global_scene_dim', 'global_scene_size', 'global_labels', 'global_pts', 'global_scene_origin', 'global_mask']
     metas_tensor_keys_inv = ['name', 'cam2img', 'world2img', 'rgb_path', 'depth_path','num_depth', 'occ_mask_valid', 'img_shape', 'img_aug_matrix', 'img_depthbranch']
-    
+
     if is_main_process():
         my_writer = SummaryWriter(args.work_dir)
+
     # training
     while epoch < max_num_epochs:
         my_model.train()
@@ -201,6 +231,7 @@ def main(args):
             for k, v in scenemeta.items():
                 if k in scenemeta_keys:
                     scenemeta[k] = torch.tensor(v).cuda()
+            
             K_Frames = len(scenemeta['monometa_list'])
             monometa_list_cuda = []
             for i in range(K_Frames):
@@ -213,21 +244,21 @@ def main(args):
 
             # forward + backward + optimize
             data_time_e = time.time()
-            
-            my_model.module.scene_init(scenemeta) 
-            
-            for i in range(K_Frames):
-                img = imgs[:, :, i, :, :, :].unsqueeze(2) # 1, 1, 1, 3, H, W
-                label = labels[:, i, :, :, :].unsqueeze(1) # 1, 1, 60, 60, 36
+
+            model.scene_init(scenemeta) 
+
+            for i in range(K_Frames):   # K_Frames:30
+                img = imgs[:, :, i, :, :, :].unsqueeze(2) # 1, 1, 1, 3, H, W    # (1 1 1 3 480 640)
+                label = labels[:, i, :, :, :].unsqueeze(1) # 1, 1, 60, 60, 36   # (1 1 60 60 36)
                 meta = [monometa_list_cuda[i]]
-                
+
                 with torch.cuda.amp.autocast(enabled=amp):
                     result_dict, my_occ, predtoreturn, gaussianstensor_to_return, instance_feature_toreturn, gaussian_to_vis = my_model(scenemeta=scenemeta, imgs=img, metas=meta, points=None, label=label, grad_frames=cfg.grad_frames, test_mode=False)
-                 
-                my_model.module.scene_update(scenemeta, gaussianstensor_to_return, instance_feature_toreturn, meta[0]['mask_in_global_from_this'])
+
+                model.scene_update(scenemeta, gaussianstensor_to_return, instance_feature_toreturn, meta[0]['mask_in_global_from_this'])
                 loss, loss_dict = loss_func(result_dict)
                 loss_record.update(loss=loss.item(), loss_dict=loss_dict)
-                
+
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -236,22 +267,22 @@ def main(args):
                 scaler.update()
                 scheduler.step_update(global_iter)
                 global_iter += 1
-                
+
                 if (i == K_Frames - 1):
                     # myfix
-                    my_model.module.globalhead.empty_scalar = my_model.module.head.empty_scalar
-                    my_model.module.globalhead.empty_scale = my_model.module.head.empty_scale
-                    my_model.module.globalhead.empty_rot = my_model.module.head.empty_rot
-                    my_model.module.globalhead.empty_sem = my_model.module.head.empty_sem
-                    my_model.module.globalhead.empty_opa = my_model.module.head.empty_opa
+                    model.globalhead.empty_scalar = model.head.empty_scalar
+                    model.globalhead.empty_scale = model.head.empty_scale
+                    model.globalhead.empty_rot = model.head.empty_rot
+                    model.globalhead.empty_sem = model.head.empty_sem
+                    model.globalhead.empty_opa = model.head.empty_opa
                     # endfix
-                    
-                    scene_result_dict = my_model.module.get_global_occ(scenemeta, meta[0]['vox_origin'], meta[0]['scene_size'])
-                    
+
+                    scene_result_dict = model.get_global_occ(scenemeta, meta[0]['vox_origin'], meta[0]['scene_size'])
+
                     global_valid_mask = scene_result_dict['mask']
                     global_label = scene_result_dict['label'][global_valid_mask].unsqueeze(0)
                     global_predict = scene_result_dict['predict'][global_valid_mask].unsqueeze(0)
-                    
+
                     global_predict[global_predict == 0] = 255
                     global_predict[global_predict == 12] = 0
                     global_label[global_label == 0] = 255
@@ -259,12 +290,12 @@ def main(args):
                     global_predict = global_predict.cpu()
                     global_label = global_label.cpu()
                     CalMeanIou_Global.add_batch(global_predict, global_label)
-                    
-                    my_model.module.scene_init(scenemeta)
-                
+
+                    model.scene_init(scenemeta)
+
                 gc.collect()
                 torch.cuda.empty_cache()
-                
+
             valid_grad = True
             time_e = time.time()
             if not valid_grad and is_main_process():
@@ -277,20 +308,20 @@ def main(args):
                 logger.info('%.5f     %.5f     %.5f' % (loss.item(), torch.mean(torch.tensor(params)).item(), torch.mean(torch.tensor(grads)).item()))
 
             if i_iter % print_freq == 0 and is_main_process():
-                
+
                 lr = optimizer.param_groups[0]['lr']
                 loss_info = loss_record.loss_info()
                 logger.info('[TRAIN] ' + scenemeta['scene_name'])
                 logger.info('[TRAIN] Epoch %d Iter %5d/%d   ' % (epoch+1, i_iter, len(train_dataset_loader)) + loss_info +
                             'GradNorm: %.3f,   lr: %.7f,   time: %.3f (%.3f)' % (grad_norm, lr, time_e - time_s, data_time_e - data_time_s))
-                
+
                 loss_record.reset()
             data_time_s = time.time()
             time_s = time.time()
-            
+
             gc.collect()
             torch.cuda.empty_cache()
-        
+
         global_status = CalMeanIou_Global.get_stats()
         global_sem_cls = global_status["iou_ssc"]
         global_sem = global_status["iou_ssc_mean"]
@@ -298,11 +329,11 @@ def main(args):
         logger.info(f'Current global iou of sem is {global_sem_cls}')
         logger.info(f'Current global iou of sem is {global_sem}')
         logger.info(f'Current global iou of geo is {global_geo}')
-        
+
         if is_main_process():
             my_writer.add_scalar('train/global_sem', global_sem, epoch)
             my_writer.add_scalar('train/global_geo', global_geo, epoch)
-        
+
         # save checkpoint
         if is_main_process():
             dict_to_save = {
@@ -320,7 +351,7 @@ def main(args):
             symlink(save_file_name, dst_file)
 
         epoch += 1
-        
+
         # eval
         if epoch % eval_freq == 0:
             my_model.eval()
@@ -348,23 +379,23 @@ def main(args):
                                 monometa[k] = torch.tensor(v).cuda()
                         monometa['img_depthbranch'] = monometa['img_depthbranch'].cuda()
                         monometa_list_cuda.append(monometa)
-                    
-                    my_model.module.scene_init(scenemeta)
-                    
+
+                    model.scene_init(scenemeta)
+
                     for i in range(K_Frames):
                         img = imgs[:, :, i, :, :, :].unsqueeze(2)
                         label = labels[:, i, :, :, :].unsqueeze(1)
                         meta = [monometa_list_cuda[i]]
                         with torch.cuda.amp.autocast(enabled=amp):
                             result_dict, my_occ, predtoreturn, gaussianstensor_to_return, instance_feature_toreturn, gaussian_to_vis = my_model(scenemeta=scenemeta, imgs=img, metas=meta, points=None, label=label, grad_frames=None, test_mode=True)
-                        my_model.module.scene_update(scenemeta, gaussianstensor_to_return, instance_feature_toreturn, meta[0]['mask_in_global_from_this'])
-                        
+                        model.scene_update(scenemeta, gaussianstensor_to_return, instance_feature_toreturn, meta[0]['mask_in_global_from_this'])
+
                         loss, loss_dict = loss_func(result_dict)
                         loss_record.update(loss=loss.item(), loss_dict=loss_dict)
-                        
+
                         voxel_predict = result_dict['ce_input'].argmax(dim=1).long() # [1, 60, 60, 36]
                         voxel_label = result_dict['ce_label'].long() # [1, 60, 60, 36]
-                        
+
                         voxel_predict[voxel_predict == 0] = 255
                         voxel_predict[voxel_predict == 12] = 0
                         voxel_label[voxel_label == 0] = 255
@@ -372,58 +403,56 @@ def main(args):
                         voxel_predict = voxel_predict.cpu()
                         voxel_label = voxel_label.cpu()
                         CalMeanIou.add_batch(voxel_predict, voxel_label)
-                        
+
                         voxel_predict = result_dict['ce_input'].argmax(dim=1).long() # [1, 60, 60, 36]
                         voxel_label = result_dict['ce_label'].long() # [1, 60, 60, 36]
                         this_fov_mask = meta[0]['fov_mask'].unsqueeze(0)
                         voxel_predict = voxel_predict[this_fov_mask].unsqueeze(0)
                         voxel_label = voxel_label[this_fov_mask].unsqueeze(0)
-                        
-                        
+
                         voxel_predict[voxel_predict == 0] = 255
                         voxel_predict[voxel_predict == 12] = 0
                         voxel_label[voxel_label == 0] = 255
                         voxel_label[voxel_label == 12] = 0
                         voxel_predict = voxel_predict.cpu()
                         voxel_label = voxel_label.cpu()
-                        
+
                         CalMeanIou_Fov.add_batch(voxel_predict, voxel_label)
-                        
+
                         if (i == K_Frames - 1):
                             # myfix
-                            my_model.module.globalhead.empty_scalar = my_model.module.head.empty_scalar
-                            my_model.module.globalhead.empty_scale = my_model.module.head.empty_scale
-                            my_model.module.globalhead.empty_rot = my_model.module.head.empty_rot
-                            my_model.module.globalhead.empty_sem = my_model.module.head.empty_sem
-                            my_model.module.globalhead.empty_opa = my_model.module.head.empty_opa
+                            model.globalhead.empty_scalar = model.head.empty_scalar
+                            model.globalhead.empty_scale = model.head.empty_scale
+                            model.globalhead.empty_rot = model.head.empty_rot
+                            model.globalhead.empty_sem = model.head.empty_sem
+                            model.globalhead.empty_opa = model.head.empty_opa
                             # endfix
-                            
-                            scene_result_dict = my_model.module.get_global_occ(scenemeta, meta[0]['vox_origin'], meta[0]['scene_size'])
-                            
+
+                            scene_result_dict = model.get_global_occ(scenemeta, meta[0]['vox_origin'], meta[0]['scene_size'])
+
                             global_valid_mask = scene_result_dict['mask']
                             global_label = scene_result_dict['label'][global_valid_mask].unsqueeze(0)
                             global_predict = scene_result_dict['predict'][global_valid_mask].unsqueeze(0)
-                            
+
                             global_predict[global_predict == 0] = 255
                             global_predict[global_predict == 12] = 0
                             global_label[global_label == 0] = 255
                             global_label[global_label == 12] = 0
                             global_predict = global_predict.cpu()
                             global_label = global_label.cpu()
-                            
+
                             CalMeanIou_Global.add_batch(global_predict, global_label)
-                            
-                            my_model.module.scene_init(scenemeta)
-                                            
+
+                            model.scene_init(scenemeta)
+
                     if i_iter_val % print_freq == 0 and is_main_process():
                         loss_info = loss_record.loss_info()
                         logger.info('[EVAL] ' + scenemeta['scene_name'])
                         logger.info('[EVAL] Iter %5d/%d   '%(i_iter_val, len(val_dataset_loader)) + loss_info)
-                        
+
                     gc.collect()
                     torch.cuda.empty_cache()
-                        
-            
+
             global_status = CalMeanIou_Global.get_stats()
             global_sem_cls = global_status["iou_ssc"]
             global_sem = global_status["iou_ssc_mean"]
@@ -431,33 +460,33 @@ def main(args):
             logger.info(f'Current global iou of sem is {global_sem_cls}')
             logger.info(f'Current global iou of sem is {global_sem}')
             logger.info(f'Current global iou of geo is {global_geo}')
-            
+
             if is_main_process():
                 my_writer.add_scalar('val/global_sem', global_sem, epoch)
                 my_writer.add_scalar('val/global_geo', global_geo, epoch)
-            
+
             stats = CalMeanIou.get_stats()
             info_sem_cls = stats["iou_ssc"]
             info_sem = stats["iou_ssc_mean"]
             info_geo = stats["iou"]
-            
+
             logger.info(f'Current single val iou of sem_cls is {info_sem_cls}')
             logger.info(f'Current single val iou of sem is {info_sem}')
             logger.info(f'Current single val iou of geo is {info_geo}')
-            
+
             stats_fov = CalMeanIou_Fov.get_stats()
             info_sem_cls_fov = stats_fov["iou_ssc"]
             info_sem_fov = stats_fov["iou_ssc_mean"]
             info_geo_fov = stats_fov["iou"]
-            
+
             logger.info(f'Current fov val iou of sem_cls is {info_sem_cls_fov}')
             logger.info(f'Current fov val iou of sem is {info_sem_fov}')
             logger.info(f'Current fov val iou of geo is {info_geo_fov}')
-            
+
             if is_main_process():
                 my_writer.add_scalar('val/sem_fov', info_sem_fov, epoch)
                 my_writer.add_scalar('val/geo_fov', info_geo_fov, epoch)
-        
+
 
 if __name__ == '__main__':
     # Training settings

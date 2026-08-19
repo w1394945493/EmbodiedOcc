@@ -4,8 +4,6 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
-
         {
             "name": "train mono",
             "type": "debugpy",
@@ -20,6 +18,23 @@
                 "TORCH_HOME": "/c20250502/wangyushen/.cache/torch",
             },
             "console": "integratedTerminal"
-        }
+        },
+        {
+            "name": "train embodied",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/train_embodied.py",
+            "args": [
+                "--py-config",
+                "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/config/customs/train_embodied_config_custom.py",
+                "--work-dir",
+                "/vepfs-mlp2/c20250502/haoce/wangyushen/Outputs/embodiedocc/outputs/train_embodied_debug",
+            ],
+            "env": {
+                "PYTHONPATH": "/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/src:/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc:/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/Depth-Anything-V2/metric_depth:/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/EfficientNet-PyTorch:/vepfs-mlp2/c20250502/haoce/wangyushen/EmbodiedOcc/model/depthbranch:${env:PYTHONPATH}",
+                "TORCH_HOME": "/c20250502/wangyushen/.cache/torch",
+            },
+            "console": "integratedTerminal"
+        },
     ]
 }
