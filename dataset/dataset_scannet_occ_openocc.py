@@ -72,6 +72,8 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         return len(self.used_subscenes)
 
     def __getitem__(self, index):
+        #! 单帧 Dataset：一个 index 对应一个相机帧的局部 Occupancy 样本，
+        #! 不按场景组织连续帧，也不维护/返回场景级全局 Occupancy 信息。
         # *【单帧流程 0：读取一个局部 Occupancy 样本】
         # * train_mono 配置 num_frames=1，因此一个 index 对应 ScanNet 场景中的
         # * 一个相机时间步：读取 RGB、深度、相机参数和 60x60x36 局部体素标签；
@@ -183,6 +185,7 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
 
         vox_origin = data["voxel_origin"]
         meta['vox_origin'] = np.round(np.array(vox_origin, dtype=np.float32), 4)
+        #! 单帧局部标签直接来自当前 gathered_data 包内的 target_1_4。
         target = data["target_1_4"] # 60, 60, 36
         target = np.transpose(target, (1, 0, 2))
         # 把代表unknown的255换成0，把代表空的0换成12
@@ -256,6 +259,7 @@ class Scannet_Scene_OpenOccupancy_Dataset(data.Dataset):
         meta['label'] = occ
         imgs = np.stack(img, 0)
         occs = np.stack(occ, 0)
+        #! 返回结构是“一帧图像 + 当前帧 meta + 一帧局部标签”；meta 没有 monometa_list。
         data_tuple = (imgs, meta, occs)
         return data_tuple
 

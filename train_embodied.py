@@ -257,6 +257,8 @@ def main(args):
                 meta = [monometa_list_cuda[i]]
 
                 with torch.cuda.amp.autocast(enabled=amp):
+                    #* result_dict 是当前帧局部 Occupancy：只由当前局部体积中被取出并细化的高斯生成，
+                    #* 不包含“历史帧已细化、但位于当前帧局部体积之外”的高斯。
                     result_dict, my_occ, predtoreturn, gaussianstensor_to_return, instance_feature_toreturn, gaussian_to_vis = my_model(scenemeta=scenemeta, imgs=img, metas=meta, points=None, label=label, grad_frames=cfg.grad_frames, test_mode=False)
 
                 # 将当前帧局部预测（已转到世界坐标）detach 后写回全局 memory，
@@ -285,6 +287,8 @@ def main(args):
 
                     # 所有视角处理结束后，将累计观测过的世界 Gaussian 聚合到
                     # 完整场景体素网格，得到场景级 global Occupancy。
+                    #* 这里才是场景级全局 Occupancy：会使用 memory 中所有 splat_flag == 1 的历史高斯，
+                    #* 包括已经不在最后一帧局部区域内、但曾被历史帧处理过的高斯。
                     scene_result_dict = model.get_global_occ(scenemeta, meta[0]['vox_origin'], meta[0]['scene_size'])
 
                     global_valid_mask = scene_result_dict['mask']
@@ -415,6 +419,8 @@ def main(args):
                         voxel_label[voxel_label == 12] = 0
                         voxel_predict = voxel_predict.cpu()
                         voxel_label = voxel_label.cpu()
+                        #* single 指标：评估每一帧完整的 60×60×36 局部体素网格，没有使用 fov_mask。
+                        #* 各验证帧的 TP/FP/FN 会持续累积，最后统一计算 IoU，并非逐帧 IoU 的平均值。
                         CalMeanIou.add_batch(voxel_predict, voxel_label)
 
                         voxel_predict = result_dict['ce_input'].argmax(dim=1).long() # [1, 60, 60, 36]
@@ -430,6 +436,8 @@ def main(args):
                         voxel_predict = voxel_predict.cpu()
                         voxel_label = voxel_label.cpu()
 
+                        #* fov 指标：仍是当前帧 Local Occ Head 的预测，但只评估 fov_mask=True 的
+                        #* 相机视野内体素；当前局部体积中位于相机视野外的体素不参与该指标。
                         CalMeanIou_Fov.add_batch(voxel_predict, voxel_label)
 
                         if (i == K_Frames - 1):
@@ -454,6 +462,8 @@ def main(args):
                             global_predict = global_predict.cpu()
                             global_label = global_label.cpu()
 
+                            #* global 指标：每个场景只在序列最后一帧统计一次，评估历史帧在线融合后的
+                            #* 场景级 Occupancy；global_valid_mask 是所有历史帧累计观测区域的并集。
                             CalMeanIou_Global.add_batch(global_predict, global_label)
 
                             model.scene_init(scenemeta)
@@ -467,8 +477,11 @@ def main(args):
                     torch.cuda.empty_cache()
 
             global_status = CalMeanIou_Global.get_stats()
+            #* global_sem_cls：全局累计观测区域内，每个语义类别各自的 IoU 数组。
             global_sem_cls = global_status["iou_ssc"]
+            #* global_sem：排除 empty 类（类别 0）后，其余语义类别 IoU 的平均值，即语义 mIoU。
             global_sem = global_status["iou_ssc_mean"]
+            #* global_geo：忽略具体语义类别，只区分 occupied/free 的场景级几何 IoU。
             global_geo = global_status["iou"]
             logger.info(f'Current global iou of sem is {global_sem_cls}')
             logger.info(f'Current global iou of sem is {global_sem}')
@@ -478,7 +491,10 @@ def main(args):
                 my_writer.add_scalar('val/global_sem', global_sem, epoch)
                 my_writer.add_scalar('val/global_geo', global_geo, epoch)
 
+            #* single：汇总所有验证帧“完整局部体素网格”的指标，不限制在相机 FOV 内。
             stats = CalMeanIou.get_stats()
+            #* info_sem_cls：逐类别语义 IoU；info_sem：排除 empty 后的语义 mIoU；
+            #* info_geo：将所有非空语义类合并为 occupied 后计算的 occupied/free 几何 IoU。
             info_sem_cls = stats["iou_ssc"]
             info_sem = stats["iou_ssc_mean"]
             info_geo = stats["iou"]
@@ -487,7 +503,10 @@ def main(args):
             logger.info(f'Current single val iou of sem is {info_sem}')
             logger.info(f'Current single val iou of geo is {info_geo}')
 
+            #* fov：汇总所有验证帧中 fov_mask=True 的相机视野内体素指标。
             stats_fov = CalMeanIou_Fov.get_stats()
+            #* info_sem_cls_fov：FOV 内逐类别语义 IoU；info_sem_fov：FOV 内语义 mIoU；
+            #* info_geo_fov：FOV 内 occupied/free 几何 IoU。
             info_sem_cls_fov = stats_fov["iou_ssc"]
             info_sem_fov = stats_fov["iou_ssc_mean"]
             info_geo_fov = stats_fov["iou"]

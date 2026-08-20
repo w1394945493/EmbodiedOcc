@@ -210,12 +210,16 @@ class GaussianNewLifterOnline(nn.Module):
             tag = tag_mask[gaussian_pool_mask]
             # tag = tag_mask[gaussian_pool_mask_detach]
             
+            #* 只有位于“当前帧局部体积”内的高斯会被取出，随后送入当前帧 Encoder 和 Local Occ Head。
+            #* 因此，历史帧虽已细化、但位于当前帧局部体积之外的高斯，不参与当前帧占据预测。
             gaussian_reused = gaussian_pool_old[gaussian_pool_mask]
             # gaussian_reused = gaussian_pool_old[gaussian_pool_mask_detach]
             # gaussian_reused = gaussian_pool_old[gaussian_pool_mask]
             # gaussian_unchange = gaussian_pool_old[~gaussian_pool_mask]
             # 当前局部体积且落入图像视野的旧 Gaussian 将由本帧重新预测，先从池中删除；
             # 当前不可见的历史 Gaussian 则保持不变。细化结果稍后由 scene_update 写回。
+            #* 不在当前帧有效处理区域内的历史高斯只原样保留在全局 memory 中；
+            #* “保留在 memory”不等于“参与当前帧 Local Occupancy 聚合”。
             gaussian_unchange = gaussian_pool_old[~gaussian_pool_mask_detach]
             gaussian_pool_new = gaussian_unchange.unsqueeze(0)
             if self.reuse_instance_feature:

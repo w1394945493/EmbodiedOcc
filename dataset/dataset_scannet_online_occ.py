@@ -68,16 +68,22 @@ class Scannet_Online_SceneOcc_Dataset(data.Dataset):
         return len(self.used_subscenes)
 
     def __getitem__(self, index):
+        #! 在线 Dataset：一个 index 对应一个完整 ScanNet 场景，而不是一个相机帧。
+        #! 该场景的有效帧会按帧号排序并整体返回，供训练代码逐帧更新 Gaussian memory。
         name = self.used_subscenes[index] # scenexxxx_xx
         meta = {}
         meta['scene_name'] = name
 
+        #! 在线版特有：读取场景级标签、体素坐标、有效区域和全部有效图片路径，
+        #! 用于初始化世界坐标 Gaussian memory，并在序列末执行全局 Occupancy 评估。
         # load global infos
         scene_pkg_pth = f'{self.occscannet_root}/global_occ_package/{name}.pkl'
         with open(scene_pkg_pth, 'rb') as f:
             scene_pkg = pickle.load(f)
         meta['global_scene_dim'] = scene_pkg['scene_dim']
         meta['global_scene_size'] = 0.08 * np.array(scene_pkg['scene_dim']) # (x_dim, y_dim, z_dim) * 0.08
+        #* 每个场景只读取这一份静态、完整的全局 Occ 标注；数据集中不存在
+        #* “第 t 帧对应一份累计全局 Occ 标注”的序列。
         meta['global_labels'] = scene_pkg['global_labels'] # (x_dim, y_dim, z_dim)
         meta['global_pts'] = scene_pkg['global_pts'] # (x_dim, y_dim, z_dim, 3)
         meta['global_scene_origin'] = np.array([scene_pkg['global_pts'][:, :, :, 0].min(), scene_pkg['global_pts'][:, :, :, 1].min(), scene_pkg['global_pts'][:, :, :, 2].min()])
@@ -108,6 +114,7 @@ class Scannet_Online_SceneOcc_Dataset(data.Dataset):
         monometa_list = []
         N_img = []
         N_occ = []
+        #! 实际序列长度取 valid_img_paths 的长度；当前 self.num_frames 并未用于截断帧数。
         for i in range(len(sorted_image_paths)):
             monometa = {}
 
@@ -125,11 +132,15 @@ class Scannet_Online_SceneOcc_Dataset(data.Dataset):
             this_name = meta['scene_name'] + '/' + img_idx
             monometa['name'] = this_name # 'scene0000_00/00000'
 
+            #! 在线版局部标签不是直接使用 gathered_data 的 target_1_4，而是读取由全局
+            #! 场景标签裁出的 local_label，同时读取本帧局部区域在全局网格中的 mask。
             # 加载global2local的occ
             my_pth = self.occscannet_root + '/streme_occ_new_package/' + self.phase + '/' + meta['scene_name'] + '_' + img_idx + '_new.pkl'
             with open(my_pth, 'rb') as f1:
                 data1 = pickle.load(f1)
                 my_target = data1['local_label']
+                #* 每帧提供的是“本帧局部区域映射到全局网格”的 mask，而不是一份
+                #* 截至本帧的累计全局 Occ；累计操作由模型运行时完成。
                 mask_in_global_from_this = data1['mask_in_global']
 
             monometa['mask_in_global_from_this'] = mask_in_global_from_this
@@ -230,6 +241,7 @@ class Scannet_Online_SceneOcc_Dataset(data.Dataset):
 
             monometa_list.append(monometa)
 
+        #! 每帧相机参数和局部几何信息放入 monometa_list；meta 顶层保存场景级信息。
         meta['monometa_list'] = monometa_list
 
         img = np.stack(N_img, 0)
@@ -237,6 +249,7 @@ class Scannet_Online_SceneOcc_Dataset(data.Dataset):
         imgs = np.stack(img, 0)
 
         occs = np.stack(N_occ, 0)
+        #! 返回结构是“整段场景图像序列 + 场景/逐帧两级 meta + 对应局部标签序列”。
         data_tuple = (imgs, meta, occs)
         return data_tuple
 

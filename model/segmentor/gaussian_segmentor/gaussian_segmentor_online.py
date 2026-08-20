@@ -194,6 +194,8 @@ class GaussianSegmentorOnline(BaseModule):
         self.gaussian_tensor = gaussian_pool_new
         self.gaussian_instance_feature = instance_feature_pool_new
         
+        #* 这里的 anchor 只来自 lifter 选出的当前局部体积高斯；局部范围外的历史高斯仍在
+        #* self.gaussian_tensor 中保存，但不会进入本帧 Encoder，也不会进入本帧 Local Occ Head。
         anchor, instance_feature_cache = self.encoder(anchor, instance_feature, mlvl_img_feats, metas, anchor_new_tag) # b, g, c
         
         return anchor, depth2occ, depthnet_output_loss, predtoreturn, anchor_new_tag, instance_feature_cache
@@ -204,6 +206,8 @@ class GaussianSegmentorOnline(BaseModule):
         self.scene_name = scenemeta['scene_name']
         self.global_scene_dim = scenemeta['global_scene_dim']
         self.global_scene_size = scenemeta['global_scene_size']
+        #* 整段视频流共享同一份场景级 global_labels；它是静态完整场景 GT，
+        #* 不会随帧更新，也不是逐帧累计生成的标注。
         self.global_labels = scenemeta['global_labels'] # [x_dim, y_dim, z_dim]
         self.global_xyz = scenemeta['global_pts']
         self.global_scene_origin = scenemeta['global_scene_origin']
@@ -256,6 +260,9 @@ class GaussianSegmentorOnline(BaseModule):
         self.gaussian_instance_feature = torch.cat([self.gaussian_instance_feature, instance_feature_fromhead_add], dim=1)
         global_mask_from_thisframe = global_mask_from_thisframe.to(dtype=torch.bool)
         # 累积截至当前帧曾经被观察过的全局体素区域，供最终全局评估/聚合使用。
+        #* 运行时真正逐帧累积的是有效区域 mask：mask_1 | mask_2 | ... | mask_t。
+        #* 数据集没有直接提供 cumulative global Occ；需要评估时，用这个累计 mask
+        #* 从上面唯一的一份 self.global_labels 中选出截至当前帧已观测区域的 GT。
         self.global_mask_thistime = self.global_mask_thistime | global_mask_from_thisframe
         
     
@@ -268,11 +275,15 @@ class GaussianSegmentorOnline(BaseModule):
         bev = bev[..., :-2]
         # splat_flag==1 表示该 Gaussian 所在区域至少被某一帧实际处理过；
         # 排除 scene_init 中尚未观察、仍为随机值的全局 Gaussian 种子。
+        #* 与逐帧局部预测不同：序列末的全局 Occupancy 会重新读取全局 memory，使用所有
+        #* splat_flag == 1 的历史高斯；所以不在最后一帧局部区域内的已处理高斯仍可参与全局预测。
         bev_valid = bev[bev_tag == 1]
         
         scene_result_dict = self.globalhead(
                         bev_feat=bev_valid.unsqueeze(0).unsqueeze(0),  # [1, 1, N, 23]
                         points=None, 
+                        #* 全局 GT 始终是场景唯一的 self.global_labels；下面的 label_mask 才是
+                        #* 多帧累计得到的观测范围，两者组合得到“累计已观测区域的全局 GT”。
                         label=self.global_labels.unsqueeze(0).unsqueeze(0), 
                         output_dict=scene_result_dict, 
                         metas=scenemeta,
@@ -347,6 +358,8 @@ class GaussianSegmentorOnline(BaseModule):
             bev_predict = bev
             output_dict = dict()
         
+        #* 本帧 Local Occ Head 只接收上面 Encoder 输出的当前局部高斯，不会读取完整
+        #* self.gaussian_tensor；局部区域外的历史高斯不会影响 result_dict['ce_input']。
         output_dict, gaussianstensor_to_return, instance_feature_toreturn, gaussians_to_vis = self.head(
             bev_feat=bev_predict,  # [1, 1, 21600, 23]
             points=points, 
